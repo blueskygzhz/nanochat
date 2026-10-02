@@ -51,6 +51,12 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--n-kv-head", type=int, default=-1, help="number of KV heads for GQA (-1 = same as query heads, i.e. MHA)")
+parser.add_argument("--attention-type", choices=["gqa", "mla"], default="gqa", help="attention architecture; MLA uses compressed latent KV cache")
+parser.add_argument("--q-lora-rank", type=int, default=0, help="MLA query compression rank (0 = direct query projection)")
+parser.add_argument("--kv-lora-rank", type=int, default=512, help="MLA joint KV compression rank")
+parser.add_argument("--qk-nope-head-dim", type=int, default=128, help="MLA non-rotary Q/K dimension per head")
+parser.add_argument("--qk-rope-head-dim", type=int, default=64, help="MLA decoupled rotary Q/K dimension (must be even)")
+parser.add_argument("--v-head-dim", type=int, default=128, help="MLA value dimension per head")
 parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to save activation memory (needed for ~7B)")
 parser.add_argument("--loss-chunk-size", type=int, default=0, help="tokens per checkpointed LM-head/loss chunk (0 = unchunked)")
 parser.add_argument("--muon-bucket-mb", type=int, default=0, help="Muon bucket target in MiB; >0 enables sequential low-memory updates (changes optimizer groups)")
@@ -136,8 +142,10 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
+using_fa3 = USE_FA3 and args.attention_type == "gqa"
+if args.attention_type == "mla":
+    print0("MLA: PyTorch SDPA training/prefill, absorbed latent-cache decode; no FlashMLA backend. Value embeddings disabled.")
+elif using_fa3:
     print0("✓ Using Flash Attention 3: efficient, new and awesome.")
 else:
     print0("!" * 80)
@@ -169,7 +177,7 @@ def build_model_meta(depth, reference=False):
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
     num_kv_heads = num_heads if args.n_kv_head == -1 else args.n_kv_head
-    if num_kv_heads > num_heads or num_heads % num_kv_heads != 0:
+    if args.attention_type == "gqa" and (num_kv_heads > num_heads or num_heads % num_kv_heads != 0):
         if not reference:
             raise ValueError(f"n-kv-head ({num_kv_heads}) must divide query heads ({num_heads})")
         num_kv_heads = num_heads
@@ -177,6 +185,8 @@ def build_model_meta(depth, reference=False):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        attention_type=args.attention_type, q_lora_rank=args.q_lora_rank, kv_lora_rank=args.kv_lora_rank,
+        qk_nope_head_dim=args.qk_nope_head_dim, qk_rope_head_dim=args.qk_rope_head_dim, v_head_dim=args.v_head_dim,
         n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
         num_experts_per_tok=args.num_experts_per_tok, moe_intermediate_mult=args.moe_intermediate_mult,
         first_k_dense_replace=args.first_k_dense_replace, moe_layer_freq=args.moe_layer_freq,
@@ -198,7 +208,8 @@ if args.n_routed_experts > 0 and ddp_world_size > 1:
 if args.dry_run:
     counts = model.num_scaling_params()
     print0(json.dumps(dict(parameter_counts=counts, active_matmul_params=model.num_matmul_params(active=True),
-                           training_flops_per_token=model.estimate_flops()), indent=2))
+                           training_flops_per_token=model.estimate_flops(), kv_bytes_per_token=model.kv_bytes_per_token(),
+                           compute_dtype=str(COMPUTE_DTYPE)), indent=2))
     print0("Meta-only check: no weights allocated and no training performed.")
     wandb_run.finish()
     compute_cleanup()
@@ -224,7 +235,7 @@ if resuming:
     if meta_data.get("user_config", {}).get("muon_bucket_mb", 0) != args.muon_bucket_mb:
         raise ValueError("Optimizer resume requires the original --muon-bucket-mb")
     model.load_state_dict(model_data, strict=True, assign=True)
-    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, model_config.n_embd // model_config.n_head)
+    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, model_config.rotary_dim)
     del model_data
 else:
     model.to_empty(device=device)
@@ -250,7 +261,7 @@ if args.fp8:
             # Routed experts see a variable token count M; the grad_weight GEMM in FP8 backward
             # contracts over M and _scaled_mm requires that to be a multiple of 16 => would crash.
             # (Shared experts see all tokens, so they are fine and stay eligible.)
-            if ".experts." in fqn:
+            if ".experts." in fqn or (args.attention_type == "mla" and ".attn." in fqn):
                 return False
             if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
                 return False

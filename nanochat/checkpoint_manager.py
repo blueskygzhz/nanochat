@@ -123,8 +123,7 @@ def build_model(checkpoint_dir, step, device, phase):
     with torch.device("meta"):
         model = GPT(model_config)
     model.load_state_dict(model_data, strict=True, assign=True)
-    head_dim = model.config.n_embd // model.config.n_head
-    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim)
+    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, model.config.rotary_dim)
     del model_data
     # Put the model in the right training phase / mode
     if phase == "eval":

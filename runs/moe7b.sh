@@ -16,7 +16,10 @@ if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 MODE=${1:-check}
 if (( $# > 0 )); then shift; fi
 NPROC=${NPROC:-8}
-MODEL_TAG=${MODEL_TAG:-moe7b}
+ATTENTION_TYPE=${ATTENTION_TYPE:-gqa}
+DEFAULT_TAG=moe7b
+if [[ "$ATTENTION_TYPE" == mla ]]; then DEFAULT_TAG=moe7b-mla; fi
+MODEL_TAG=${MODEL_TAG:-$DEFAULT_TAG}
 WANDB_RUN=${WANDB_RUN:-dummy}
 DEVICE_BATCH=${DEVICE_BATCH:-1}
 SEQ_LEN=${SEQ_LEN:-2048}
@@ -39,6 +42,8 @@ if [[ "$MODE" == prepare ]]; then
 fi
 common=(
     --depth=24 --aspect-ratio=85 --head-dim=128 --n-kv-head=4
+    --attention-type="$ATTENTION_TYPE" --q-lora-rank="${Q_LORA_RANK:-0}" --kv-lora-rank="${KV_LORA_RANK:-512}"
+    --qk-nope-head-dim="${QK_NOPE_HEAD_DIM:-128}" --qk-rope-head-dim="${QK_ROPE_HEAD_DIM:-64}" --v-head-dim="${V_HEAD_DIM:-128}"
     --max-seq-len="$SEQ_LEN" --window-pattern="${WINDOW_PATTERN:-SSSL}"
     --n-routed-experts=48 --n-shared-experts=2 --num-experts-per-tok=6
     --moe-intermediate-mult=0.6875 --first-k-dense-replace=1 --aux-loss-alpha=0.001

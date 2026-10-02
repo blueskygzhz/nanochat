@@ -138,8 +138,12 @@ def main():
     max_rows = int((total_vram - w_bytes) / (kv_store * config.sequence_len))
 
     print("=" * 100)
+    attention_info = (f"MLA latent {config.kv_lora_rank} + RoPE {config.qk_rope_head_dim}"
+                      if config.attention_type == "mla" else f"GQA kv heads {config.n_kv_head}")
     print(f"Model: {args.source} {meta.get('model_tag', '')} (step {meta['step']}) | "
-          f"depth {config.n_layer}, dim {config.n_embd}, heads {config.n_head}, kv heads {config.n_kv_head} (GQA)")
+          f"depth {config.n_layer}, dim {config.n_embd}, heads {config.n_head}, {attention_info}")
+    if config.attention_type == "mla":
+        print("MLA reference backend: logical cache traffic estimate, not measured HBM traffic; no FlashMLA kernel.")
     print(f"GPU: {device_name} | peak bandwidth {peak_bw/1e12:.2f} TB/s | peak compute {peak_flops/1e12:.0f} TFLOPS | VRAM {total_vram/2**30:.0f} GiB")
     print("-" * 100)
     dtype_counts = {}

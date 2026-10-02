@@ -64,6 +64,30 @@ uv sync --extra gpu --group dev
 
 模型 checkpoint 保持兼容；旧优化器 checkpoint 恢复须使用原 `MUON_BUCKET_MB`（旧版为 0），不能直接套用新桶布局。每个保存点的权重与全部优化器分片合计约 60GB，需为多次保存预留空间。数据恢复仍为 row-group 级近似恢复，并非逐 token 精确重放。正式训练前建议至少做数百步稳定性实验，依据 `val/bpb`、step time、显存峰值决定预算；不能仅按激活参数套用稠密模型缩放定律。
 
+### 可选 DeepSeek 风格 MLA
+
+默认仍为 GQA。设置 `ATTENTION_TYPE=mla` 可启用 Multi-head Latent Attention：KV 联合低秩压缩、解耦 RoPE、可选 Q 低秩投影；latent RMSNorm 使用可训练权重并归入 AdamW。实现位于 `nanochat/mla.py`，参考 [DeepSeek 官方 MLA](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py)。
+
+| 操作 | 命令 |
+|---|---|
+| MLA 参数预检查 | `ATTENTION_TYPE=mla bash runs/moe7b.sh check` |
+| MLA 冒烟训练 | `ATTENTION_TYPE=mla bash runs/moe7b.sh smoke` |
+| MLA 正式训练 | `ATTENTION_TYPE=mla bash runs/moe7b.sh train` |
+| 从 MLA checkpoint 做 SFT | `ATTENTION_TYPE=mla bash runs/moe7b.sh sft` |
+| MLA 评测 | `ATTENTION_TYPE=mla bash runs/moe7b.sh eval` |
+
+默认模型标签自动改为 `moe7b-mla`，避免与 GQA 混用。默认 `Q_LORA_RANK=0`（直接投影 Q）、`KV_LORA_RANK=512`、`QK_NOPE_HEAD_DIM=128`、`QK_ROPE_HEAD_DIM=64`、`V_HEAD_DIM=128`。如需压缩 Q，可设置 `Q_LORA_RANK=512`。也可直接给 `scripts.base_train` 传 `--attention-type=mla`、`--q-lora-rank`、`--kv-lora-rank`、`--qk-nope-head-dim`、`--qk-rope-head-dim`、`--v-head-dim`；这些架构字段随 checkpoint 保存，SFT/推理自动恢复。
+
+训练和首段 prefill 将 latent 展开为各头 K/V，使用 PyTorch SDPA；后续单 token 或多 token 续写使用吸收形式：Q 非位置部分乘 K 上投影权重，与缓存 latent 做 attention；先对 latent 加权汇总，再做 V 上投影。持久缓存只保存 `[layers, batch, length, kv_lora_rank]` 和 `[layers, batch, length, rope_dim]`，不保存或重建历史各头 K/V。支持因果/滑窗、前缀复制到多个采样行、reset、容量校验；仅支持批内统一位置的推理缓存，不支持 ragged continuous batching。
+
+默认 24 层配置下，BF16 的每 token、每行缓存（不含少量位置/smear 状态）：GQA 为 `24 × 2 × 4 × 128 × 2 = 49152` 字节，MLA 为 `24 × (512+64) × 2 = 27648` 字节，减少 **43.75%**。这仅是持久 KV 容量；吸收式参考实现会两次使用 latent，并有 attention scores 等临时张量，不能把容量降低直接等同于带宽或延迟提升。`check` 在 CPU 默认 FP32，显示的字节数会翻倍，并打印实际 compute dtype。
+
+兼容性与限制：
+- MLA 禁用原 GQA 的 Value Embedding 和完整 Q/K head norm，使用 latent norm 与 `(nope_dim+rope_dim)^(-1/2)` scale，以保持投影吸收成立；保留 nanochat 的 RoPE 方向/基频，不包含 DeepSeek 的 YaRN 扩展。其他 MoE、smear/backout、loss 分块和激活重计算不变。
+- 默认 MLA 总参数约 **7.133B**（32768 词表），含 LM head 的激活矩阵约 **1.494B**；切换后参数量和默认 token 预算会变化，不应继续套用 GQA 的精确统计。
+- **GQA checkpoint 不能直接当 MLA checkpoint 恢复**，也不支持直接导入官方 DeepSeek 权重。旧 GQA checkpoint 缺失这些字段时继续使用 GQA；切换 MLA 需要新训练或另行做转换/蒸馏。
+- 首版 MLA 注意力不参与本地 FP8 Linear 转换；`--fp8` 仍可作用于其他符合条件的层。尚未接入 FlashMLA、专用 Triton kernel、分页 KV 或张量并行。SDPA 能否选择高效 CUDA kernel 取决于硬件、维度和 mask；带滑窗的训练可能退回较慢路径。先测小模型数值和真实 GPU 显存/吞吐，再长跑。
+
 ### Reproduce and talk to GPT-2
 
 The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:

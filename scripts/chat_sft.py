@@ -90,12 +90,12 @@ else:
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
-# Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
-
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+if model.config.attention_type == "mla":
+    print0("MLA: PyTorch SDPA training with latent-cache inference; no FlashMLA backend")
+elif not HAS_FA3:
+    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})

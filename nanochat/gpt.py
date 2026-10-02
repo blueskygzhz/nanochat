@@ -22,6 +22,7 @@ import torch.utils.checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
+from nanochat.mla import MultiHeadLatentAttention, LatentRMSNorm
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -54,6 +55,25 @@ class GPTConfig:
     routed_scaling_factor: float = 1.0    # scales routed output when norm_topk_prob is False
     aux_loss_alpha: float = 0.001         # load-balancing auxiliary loss weight
     seq_aux: bool = True                  # per-sequence aux loss (vs global over all tokens)
+    attention_type: str = "gqa"
+    q_lora_rank: int = 0
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+
+    def __post_init__(self):
+        if self.attention_type not in ("gqa", "mla"):
+            raise ValueError("attention_type must be gqa or mla")
+        if self.attention_type == "mla":
+            if self.q_lora_rank < 0 or min(self.kv_lora_rank, self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim) <= 0:
+                raise ValueError("MLA dimensions must be positive (q_lora_rank may be zero)")
+            if self.qk_rope_head_dim % 2:
+                raise ValueError("MLA rotary dimension must be even")
+
+    @property
+    def rotary_dim(self):
+        return self.qk_rope_head_dim if self.attention_type == "mla" else self.n_embd // self.n_head
 
 
 def norm(x):
@@ -319,7 +339,8 @@ class MoE(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = (MultiHeadLatentAttention(config, layer_idx, Linear, apply_rotary_emb)
+                     if config.attention_type == "mla" else CausalSelfAttention(config, layer_idx))
         self.mlp = MoE(config) if is_moe_layer(layer_idx, config) else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -364,14 +385,14 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer)
+                                          if config.attention_type == "gqa" and has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, config.rotary_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
         # Activation checkpointing (runtime flag, not part of the config/checkpoint): recompute each
@@ -403,10 +424,13 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if isinstance(block.attn, MultiHeadLatentAttention):
+                block.attn.init_weights()
+            else:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
             if isinstance(block.mlp, MoE):
                 # Every expert (routed and shared) mirrors the dense MLP init
                 experts = list(block.mlp.experts)
@@ -441,12 +465,11 @@ class GPT(nn.Module):
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
+            if isinstance(block.attn, CausalSelfAttention) and block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.config.rotary_dim)
         self.cos, self.sin = cos, sin
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
@@ -518,6 +541,9 @@ class GPT(nn.Module):
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
+        if self.config.attention_type == "mla":
+            # Model FLOPs: excludes checkpoint recomputation, SDPA padding and softmax.
+            return 3 * self.estimate_prefill_flops(self.config.sequence_len) / self.config.sequence_len
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -554,6 +580,10 @@ class GPT(nn.Module):
         2 FLOPs per matmul param, plus attention over min(context, window) per layer.
         """
         h = self.config.n_head
+        if self.config.attention_type == "mla":
+            width = 2 * self.config.kv_lora_rank + self.config.qk_rope_head_dim
+            attended = sum(context_len if w < 0 else min(context_len, w + 1) for w, _ in self.window_sizes)
+            return 2 * self.num_matmul_params(active=True) + 2 * h * width * attended
         q = self.config.n_embd // self.config.n_head
         attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
         decode_flops = 2 * self.num_matmul_params(active=True) + attn_flops
@@ -563,23 +593,36 @@ class GPT(nn.Module):
         """Forward FLOPs to prefill a prompt: causal, so token t attends to min(t, window)."""
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
+        mla = self.config.attention_type == "mla"
+        pair_flops = 2 * h * (self.config.qk_nope_head_dim + self.config.qk_rope_head_dim + self.config.v_head_dim) if mla else 4 * h * q
         attn_flops = 0
         for window, _ in self.window_sizes:
-            w = min(window, num_tokens)
+            w = min(window + 1, num_tokens) if mla and window >= 0 else min(window, num_tokens)
+            if window < 0:
+                w = num_tokens
             attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
-            attn_flops += 4 * h * q * attended_tokens
+            attn_flops += pair_flops * attended_tokens
         prefill_flops = 2 * self.num_matmul_params(active=True) * num_tokens + attn_flops
         return prefill_flops
 
     def kv_bytes_per_token(self):
-        """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
+        """Bytes to store one token of persistent KV cache, per row (all layers)."""
+        if self.config.attention_type == "mla":
+            return self.config.n_layer * (self.config.kv_lora_rank + self.config.qk_rope_head_dim) * COMPUTE_DTYPE.itemsize
         head_dim = self.config.n_embd // self.config.n_head
-        kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
+        kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
-        """Bytes of KV cache *read* by one decode step at a given context length, per row.
-        Sliding window layers only attend to (and read) the last `window` tokens."""
+        """Logical cache reads per decode step, not measured HBM traffic.
+
+        MLA consumes latent twice (scores and weighted sum), rotary keys once.
+        Actual traffic depends on head reuse, kernel tiling and temporary tensors.
+        """
+        if self.config.attention_type == "mla":
+            width = 2 * self.config.kv_lora_rank + self.config.qk_rope_head_dim
+            attended = sum(context_len if w < 0 else min(context_len, w + 1) for w, _ in self.window_sizes)
+            return width * COMPUTE_DTYPE.itemsize * attended
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
@@ -634,17 +677,19 @@ class GPT(nn.Module):
         # updates make little sense for a routing matrix. Also keeps them out of the shape-stacked
         # Muon groups. No weight decay (decaying the router just drags routing back to uniform).
         router_params = [m.weight for m in self.modules() if isinstance(m, MoEGate)]
+        latent_norm_params = [m.weight for m in self.modules() if isinstance(m, LatentRMSNorm)]
         router_ids = {id(p) for p in router_params}
+        adamw_ids = router_ids | {id(p) for p in latent_norm_params}
 
         # Separate out all parameters into groups
-        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in router_ids]
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in adamw_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(router_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(router_params) + len(latent_norm_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -663,6 +708,9 @@ class GPT(nn.Module):
         if router_params:
             lr = (matrix_lr if router_lr is None else router_lr) * dmodel_lr_scale
             param_groups.append(dict(kind='adamw', params=router_params, lr=lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        if latent_norm_params:
+            param_groups.append(dict(kind='adamw', params=latent_norm_params, lr=matrix_lr * dmodel_lr_scale,
+                                     betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Buckets preserve matrix boundaries; one matrix is the minimum allocation unit.
         world_size = get_dist_info()[3]
         for shape in sorted({p.shape for p in matrix_params}):
@@ -708,6 +756,17 @@ class GPT(nn.Module):
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        if T0 + T > self.cos.size(1):
+            raise ValueError("Sequence exceeds rotary cache capacity")
+        if kv_cache is not None:
+            if self.config.attention_type == "mla" and torch.is_grad_enabled():
+                raise ValueError("MLA cache is inference-only; disable gradient tracking")
+            if getattr(kv_cache, 'attention_type', 'gqa') != self.config.attention_type:
+                raise ValueError("KV cache attention type does not match model")
+            if kv_cache.batch_size != B or kv_cache.n_layers != self.config.n_layer:
+                raise ValueError("KV cache batch/layer shape mismatch")
+            if T0 + T > kv_cache.max_seq_len:
+                raise ValueError("KV cache capacity exceeded")
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
@@ -726,9 +785,12 @@ class GPT(nn.Module):
             x_pre_smear = kv_cache.prev_embedding
             kv_cache.prev_embedding = x[:, -1:, :]
             if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+                first = x[:, :1]
+                if x_pre_smear is not None:
+                    first_gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(first[:, :, :24]))
+                    first = first + first_gate * x_pre_smear
+                x = torch.cat([first, x[:, 1:] + gate * x[:, :-1]], dim=1)
             elif x_pre_smear is not None:
                 # Decode: single token, use cached prev embedding
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))

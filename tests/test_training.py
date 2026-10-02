@@ -50,9 +50,12 @@ def offline_training(monkeypatch, tmp_path):
     return run, tmp_path / 'base_checkpoints' / 'unit'
 
 
-def test_training_save_resume_and_inference(offline_training):
+@pytest.mark.parametrize('attention', ['gqa', 'mla'])
+def test_training_save_resume_and_inference(offline_training, attention):
     run, directory = offline_training
-    result = run()
+    arch = [f'--attention-type={attention}', '--q-lora-rank=16', '--kv-lora-rank=16',
+            '--qk-nope-head-dim=12', '--qk-rope-head-dim=8', '--v-head-dim=10']
+    result = run(*arch)
     assert result['step'] == 2
     assert result['optimizer'].memory_efficient
     assert checkpoints.find_last_step(directory) == 2
@@ -69,7 +72,7 @@ def test_training_save_resume_and_inference(offline_training):
     x = torch.tensor([[1, 2, 3, 4]])
     with torch.no_grad():
         torch.testing.assert_close(loaded(x), result['orig_model'](x))
-    resumed = run('--resume-from-step=2', '--num-iterations=3')
+    resumed = run(*arch, '--resume-from-step=2', '--num-iterations=3')
     assert resumed['step'] == 3
     assert checkpoints.find_last_step(directory) == 3
 

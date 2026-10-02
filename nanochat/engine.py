@@ -89,6 +89,16 @@ class KVCache:
     - Position tracked per batch element via cache_seqlens tensor
     """
 
+    attention_type = "gqa"
+
+    @classmethod
+    def from_config(cls, config, batch_size, seq_len, device, dtype):
+        if getattr(config, 'attention_type', 'gqa') == 'mla':
+            return MLAKVCache(batch_size, seq_len, config.n_layer, config.kv_lora_rank,
+                              config.qk_rope_head_dim, device, dtype)
+        return cls(batch_size, config.n_kv_head, seq_len, config.n_embd // config.n_head,
+                   config.n_layer, device, dtype)
+
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
         self.batch_size = batch_size
         self.max_seq_len = seq_len
@@ -135,6 +145,70 @@ class KVCache:
         # Copy smear state: expand batch=1 prev_embedding to num_samples
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+
+class MLAKVCache:
+    """Uniform-position cache storing only normalized KV latents and rotated shared keys."""
+    attention_type = "mla"
+
+    def __init__(self, batch_size, seq_len, num_layers, kv_rank, rope_dim, device, dtype):
+        if min(batch_size, seq_len, num_layers, kv_rank, rope_dim) <= 0:
+            raise ValueError('MLA cache dimensions must be positive')
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.n_layers = num_layers
+        self.kv_rank = kv_rank
+        self.rope_dim = rope_dim
+        self.latent_cache = torch.zeros(num_layers, batch_size, seq_len, kv_rank, device=device, dtype=dtype)
+        self.rope_cache = torch.zeros(num_layers, batch_size, seq_len, rope_dim, device=device, dtype=dtype)
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.prev_embedding = None
+        self._pos = 0
+
+    def get_pos(self):
+        return self._pos
+
+    def reset(self):
+        self._pos = 0
+        self.cache_seqlens.zero_()
+        self.prev_embedding = None
+
+    def advance(self, num_tokens):
+        if num_tokens < 0 or self._pos + num_tokens > self.max_seq_len:
+            raise ValueError('MLA cache capacity exceeded')
+        self._pos += num_tokens
+        self.cache_seqlens.fill_(self._pos)
+
+    def get_layer_cache(self, layer_idx):
+        return self.latent_cache[layer_idx], self.rope_cache[layer_idx]
+
+    def write_layer(self, layer_idx, latent, rope):
+        if torch.is_grad_enabled():
+            raise ValueError('MLA cache writes require no_grad or inference_mode')
+        T = latent.size(1)
+        if latent.shape != (self.batch_size, T, self.kv_rank) or rope.shape != (self.batch_size, T, self.rope_dim):
+            raise ValueError('MLA cache shape mismatch')
+        if (latent.device != self.latent_cache.device or latent.dtype != self.latent_cache.dtype
+                or rope.device != self.rope_cache.device or rope.dtype != self.rope_cache.dtype):
+            raise ValueError('MLA cache device/dtype mismatch')
+        if self._pos + T > self.max_seq_len:
+            raise ValueError('MLA cache capacity exceeded')
+        self.latent_cache[layer_idx, :, self._pos:self._pos + T].copy_(latent)
+        self.rope_cache[layer_idx, :, self._pos:self._pos + T].copy_(rope)
+
+    def prefill(self, other):
+        if not isinstance(other, MLAKVCache) or (self.n_layers, self.kv_rank, self.rope_dim) != (other.n_layers, other.kv_rank, other.rope_dim):
+            raise ValueError('Incompatible MLA cache layouts')
+        if self._pos != 0 or other._pos > self.max_seq_len or other.batch_size not in (1, self.batch_size):
+            raise ValueError('Invalid MLA cache prefix copy')
+        if self.latent_cache.dtype != other.latent_cache.dtype or self.latent_cache.device != other.latent_cache.device:
+            raise ValueError('MLA cache device/dtype mismatch')
+        pos = other._pos
+        self.latent_cache[:, :, :pos].copy_(other.latent_cache[:, :, :pos])
+        self.rope_cache[:, :, :pos].copy_(other.rope_cache[:, :, :pos])
+        self.advance(pos)
+        if other.prev_embedding is not None:
+            self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
@@ -193,27 +267,14 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        kv_cache_prefill = KVCache.from_config(m, batch_size=1, seq_len=len(tokens), device=device, dtype=dtype)
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        kv_cache_decode = KVCache.from_config(m, batch_size=num_samples, seq_len=kv_length_hint, device=device, dtype=dtype)
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
 
