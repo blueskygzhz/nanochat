@@ -435,6 +435,99 @@ def test_activation_checkpointing_matches_plain_backward():
         torch.testing.assert_close(grads_a[n], grads_b[n], rtol=1e-4, atol=1e-6, msg=n)
 
 
+@pytest.mark.parametrize('reduction', ['mean', 'sum', 'none'])
+@pytest.mark.parametrize('checkpointing', [False, True])
+def test_chunked_loss_matches_full_loss_and_gradients(reduction, checkpointing):
+    torch.manual_seed(7)
+    model = build_model(make_config(n_layer=2, vocab_size=131))
+    model.activation_checkpointing = checkpointing
+    for p in model.parameters():
+        if p.ndim == 2:
+            torch.nn.init.normal_(p, std=0.05)
+    idx = torch.randint(0, 131, (2, 8))
+    targets = torch.randint(0, 131, (2, 8))
+    targets[0, :5] = -1
+
+    def run(chunk_size):
+        model.zero_grad(set_to_none=True)
+        model.loss_chunk_size = chunk_size
+        loss = model(idx, targets, loss_reduction=reduction)
+        loss.sum().backward()
+        return loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    expected, grads = run(0)
+    actual, chunk_grads = run(5)
+    torch.testing.assert_close(actual, expected)
+    assert grads.keys() == chunk_grads.keys()
+    for name in grads:
+        torch.testing.assert_close(chunk_grads[name], grads[name], rtol=2e-4, atol=2e-6, msg=name)
+    model.eval()
+    with torch.no_grad():
+        model.loss_chunk_size = 0
+        expected_eval = model(idx, targets, loss_reduction=reduction)
+        model.loss_chunk_size = 5
+        torch.testing.assert_close(model(idx, targets, loss_reduction=reduction), expected_eval)
+
+
+def test_fp8_conversion_preserves_flop_counts():
+    from nanochat.fp8 import convert_to_float8_training
+    model = build_model(make_config(n_layer=2))
+    before = (model.num_matmul_params(), model.num_matmul_params(active=True), model.estimate_flops(),
+              model.estimate_decode_flops(16), model.estimate_prefill_flops(16))
+    convert_to_float8_training(model)
+    after = (model.num_matmul_params(), model.num_matmul_params(active=True), model.estimate_flops(),
+             model.estimate_decode_flops(16), model.estimate_prefill_flops(16))
+    assert after == before
+
+
+@pytest.mark.parametrize('kw', [dict(num_experts_per_tok=0), dict(n_group=0),
+                                dict(topk_group=0), dict(n_group=4, topk_group=1, num_experts_per_tok=3)])
+def test_invalid_router_config_fails_early(kw):
+    with pytest.raises(AssertionError):
+        MoEGate(make_config(topk_method='group_limited_greedy', **kw))
+
+
+def test_global_aux_matches_one_hot_value_and_gradient():
+    gate = MoEGate(make_config(seq_aux=False))
+    torch.nn.init.normal_(gate.weight, std=0.05)
+    x = torch.randn(2, 9, 64, requires_grad=True)
+    idx, _, actual = gate(x)
+    scores = F.linear(x.reshape(-1, 64), gate.weight).softmax(-1)
+    fractions = F.one_hot(idx.reshape(-1), gate.n_routed_experts).float().mean(0)
+    expected = gate.alpha * gate.n_routed_experts * (scores.mean(0) * fractions).sum()
+    torch.testing.assert_close(actual, expected)
+    got = torch.autograd.grad(actual, (x, gate.weight), retain_graph=True)
+    want = torch.autograd.grad(expected, (x, gate.weight))
+    for a, b in zip(got, want):
+        torch.testing.assert_close(a, b)
+
+
+def test_bucketed_optimizer_matches_unbucketed_and_resumes(monkeypatch):
+    import copy
+    import nanochat.optim as optim
+    monkeypatch.setattr(optim, 'adamw_step_fused', optim.adamw_step_fused._torchdynamo_orig_callable)
+    monkeypatch.setattr(optim, 'muon_step_fused', optim.muon_step_fused._torchdynamo_orig_callable)
+    torch.manual_seed(9)
+    plain = build_model(make_config(n_layer=2))
+    bucketed = copy.deepcopy(plain)
+    a = plain.setup_optimizer()
+    b = bucketed.setup_optimizer(muon_bucket_mb=0.04)
+    assert b.memory_efficient
+    assert len(b.param_groups) > len(a.param_groups)
+    for _ in range(3):
+        for i, (p, q) in enumerate(zip(plain.parameters(), bucketed.parameters())):
+            grad = None if i % 7 == 0 else torch.randn_like(p)
+            p.grad = grad
+            q.grad = None if grad is None else grad.clone()
+        a.step()
+        b.step()
+        for p, q in zip(plain.parameters(), bucketed.parameters()):
+            torch.testing.assert_close(p, q)
+        restored = bucketed.setup_optimizer(muon_bucket_mb=0.04)
+        restored.load_state_dict(copy.deepcopy(b.state_dict()))
+        b = restored
+
+
 def test_generate_works_with_moe():
     config = make_config(n_layer=3)
     model = build_model(config)

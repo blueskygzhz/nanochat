@@ -377,6 +377,7 @@ class GPT(nn.Module):
         # Activation checkpointing (runtime flag, not part of the config/checkpoint): recompute each
         # Block in backward instead of storing its activations. ~30% slower, needed for big models.
         self.activation_checkpointing = False
+        self.loss_chunk_size = 0
 
     @torch.no_grad()
     def init_weights(self):
@@ -538,7 +539,7 @@ class GPT(nn.Module):
         for a MoE layer is top_k of n_routed_experts (plus the always-on shared experts).
         Use active=True for any FLOPs/MFU math, total for memory/checkpoint math.
         """
-        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, (nn.Linear, MoEGate)))
         if active:
             for block in self.transformer.h:
                 if isinstance(block.mlp, MoE):
@@ -624,7 +625,9 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, router_lr=None):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, router_lr=None, muon_bucket_mb=0):
+        if muon_bucket_mb < 0:
+            raise ValueError("muon_bucket_mb must be non-negative")
         model_dim = self.config.n_embd
 
         # MoE routers get AdamW, not Muon: they are tiny (n_experts x n_embd), and orthogonalized
@@ -660,15 +663,22 @@ class GPT(nn.Module):
         if router_params:
             lr = (matrix_lr if router_lr is None else router_lr) * dmodel_lr_scale
             param_groups.append(dict(kind='adamw', params=router_params, lr=lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
-        # Muon groups (matrix params, grouped by shape for stacking)
+        # Buckets preserve matrix boundaries; one matrix is the minimum allocation unit.
+        world_size = get_dist_info()[3]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
+            bucket_size = len(group_params)
+            if muon_bucket_mb > 0:
+                p = group_params[0]
+                capacity = max(1, int(muon_bucket_mb * 1024**2) // (p.numel() * p.element_size()))
+                bucket_size = max(world_size, (capacity // world_size) * world_size)
+            for start in range(0, len(group_params), bucket_size):
+                param_groups.append(dict(
+                    kind='muon', params=group_params[start:start + bucket_size], lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                ))
 
-        optimizer = MuonAdamW(param_groups)
+        optimizer = MuonAdamW(param_groups, memory_efficient=muon_bucket_mb > 0)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -681,6 +691,13 @@ class GPT(nn.Module):
             if isinstance(block.mlp, MoE) and block.mlp.aux_loss is not None:
                 aux = block.mlp.aux_loss if aux is None else aux + block.mlp.aux_loss
         return aux
+
+    def _compute_logits(self, x):
+        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+        return 15 * torch.tanh(logits / 15)
+
+    def _loss_chunk(self, x, targets, reduction):
+        return F.cross_entropy(self._compute_logits(x), targets, ignore_index=-1, reduction=reduction)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
@@ -738,28 +755,38 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        if targets is None:
+            return self._compute_logits(x)
 
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            # Add the MoE load-balancing auxiliary loss (only non-None while training a MoE model).
-            # Only for 'mean': with 'none' the caller wants per-token values (RL, bpb eval) and a
-            # scalar would broadcast into every element; with 'sum' the scales don't match.
+        chunk_size = self.loss_chunk_size
+        if chunk_size > 0:
+            x_flat = x.reshape(-1, x.size(-1))
+            targets_flat = targets.reshape(-1)
+            reduction = 'none' if loss_reduction == 'none' else 'sum'
+            if loss_reduction not in ('none', 'sum', 'mean'):
+                raise ValueError(f"Unsupported loss reduction: {loss_reduction}")
+            losses = []
+            for start in range(0, x_flat.size(0), chunk_size):
+                chunk_args = (x_flat[start:start + chunk_size], targets_flat[start:start + chunk_size], reduction)
+                if self.training and torch.is_grad_enabled():
+                    loss_chunk = torch.utils.checkpoint.checkpoint(
+                        self._loss_chunk, *chunk_args, use_reentrant=False,
+                    )
+                else:
+                    loss_chunk = self._loss_chunk(*chunk_args)
+                losses.append(loss_chunk)
+            loss = torch.cat(losses) if reduction == 'none' else torch.stack(losses).sum()
             if loss_reduction == 'mean':
-                aux = self.collect_aux_loss()
-                if aux is not None:
-                    loss = loss + aux.to(loss.dtype)
-            return loss
+                loss = loss / (targets_flat != -1).sum()
         else:
-            # inference: just return the logits directly
-            return logits
+            logits = self._compute_logits(x)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1, reduction=loss_reduction)
+
+        if loss_reduction == 'mean':
+            aux = self.collect_aux_loss()
+            if aux is not None:
+                loss = loss + aux.to(loss.dtype)
+        return loss
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

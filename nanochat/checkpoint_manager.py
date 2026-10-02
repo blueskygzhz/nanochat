@@ -38,26 +38,54 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
+def _atomic_save(data, path, as_json=False):
+    temp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        if as_json:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        else:
+            torch.save(data, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    """All ranks must participate when saving a distributed optimizer; model-only saves need rank 0."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    world_size = torch.distributed.get_world_size() if distributed else 1
     if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
+        _atomic_save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
-        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
-        logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
-        os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        logger.info(f"Saved optimizer state to: {optimizer_path}")
+        _atomic_save(optimizer_data, optimizer_path)
+        if distributed:
+            torch.distributed.barrier()
+    if rank == 0:
+        metadata = dict(meta_data, world_size=world_size)
+        metadata["optimizer_shards"] = [f"optim_{step:06d}_rank{r}.pt" for r in range(world_size)] if optimizer_data is not None else []
+        _atomic_save(metadata, meta_path, as_json=True)
+        logger.info(f"Published complete checkpoint: {meta_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
+    if load_optimizer:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if meta_data.get("world_size", torch.distributed.get_world_size()) != torch.distributed.get_world_size():
+                raise ValueError("Optimizer checkpoint world size does not match current process group")
+        for filename in meta_data.get("optimizer_shards", []):
+            if not os.path.isfile(os.path.join(checkpoint_dir, filename)):
+                raise FileNotFoundError(f"Incomplete optimizer checkpoint: {filename}")
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
@@ -66,10 +94,6 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         optimizer_data = torch.load(optimizer_path, map_location=device)
-    # Load the metadata
-    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
 
 
@@ -98,10 +122,10 @@ def build_model(checkpoint_dir, step, device, phase):
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
-    # Load the model state
-    model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
+    head_dim = model.config.n_embd // model.config.n_head
+    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, head_dim)
+    del model_data
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
@@ -135,12 +159,22 @@ def find_largest_model(checkpoints_dir):
 
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
-    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if re.search(r'model_(\d+)\.pt$', f)]
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = max(int(f.split("_")[-1].split(".")[0]) for f in checkpoint_files)
-    return last_step
+    steps = []
+    for filename in os.listdir(checkpoint_dir):
+        match = re.fullmatch(r'model_(\d+)\.pt', filename)
+        if match is None:
+            continue
+        step = int(match.group(1))
+        try:
+            with open(os.path.join(checkpoint_dir, f"meta_{step:06d}.json"), encoding="utf-8") as f:
+                metadata = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if all(os.path.isfile(os.path.join(checkpoint_dir, name)) for name in metadata.get("optimizer_shards", [])):
+            steps.append(step)
+    if not steps:
+        raise FileNotFoundError(f"No complete checkpoints found in {checkpoint_dir}")
+    return max(steps)
 
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure

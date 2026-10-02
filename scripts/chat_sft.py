@@ -48,6 +48,9 @@ parser.add_argument("--max-seq-len", type=int, default=None, help="max context l
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
 parser.add_argument("--activation-checkpointing", type=int, default=-1, help="1=on, 0=off, -1=inherit from pretrain")
+parser.add_argument("--loss-chunk-size", type=int, default=None, help="LM-head loss chunk size (default: inherit)")
+parser.add_argument("--muon-bucket-mb", type=int, default=None, help="Muon bucket target in MiB (default: inherit)")
+parser.add_argument("--no-compile", action="store_true", help="disable model compilation")
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
@@ -103,6 +106,8 @@ for name, fallback, source in [
     ("embedding_lr",      0.3,   pretrain_user_config),
     ("unembedding_lr",    0.004, pretrain_user_config),
     ("matrix_lr",         0.02,  pretrain_user_config),
+    ("loss_chunk_size",   0,     pretrain_user_config),
+    ("muon_bucket_mb",    0,     pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -118,10 +123,18 @@ for name, fallback, source in [
 if args.activation_checkpointing < 0:
     args.activation_checkpointing = int(bool(pretrain_user_config.get("activation_checkpointing", False)))
 model.activation_checkpointing = bool(args.activation_checkpointing)
+if args.loss_chunk_size < 0 or args.muon_bucket_mb < 0:
+    raise ValueError("loss-chunk-size and muon-bucket-mb must be non-negative")
+model.loss_chunk_size = args.loss_chunk_size
+if args.load_optimizer and (args.muon_bucket_mb != pretrain_user_config.get("muon_bucket_mb", 0)
+                           or ddp_world_size != meta.get("world_size", ddp_world_size)):
+    raise ValueError("Optimizer warm-start requires the original world size and muon-bucket-mb; use --load-optimizer=0 to reset")
+user_config.update(vars(args))
 print0(f"Activation checkpointing: {model.activation_checkpointing}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if not args.no_compile:
+    model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -135,7 +148,7 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0, muon_bucket_mb=args.muon_bucket_mb)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -406,15 +419,7 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                "model_config": dict(vars(orig_model.config)),
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,

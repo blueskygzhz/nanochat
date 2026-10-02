@@ -43,6 +43,27 @@ For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
 uv sync --extra gpu --group dev
 ```
 
+### 本分支：实验性 7B MoE 训练
+
+`runs/moe7b.sh` 配置为 **7.26B 总参数 MoE**，不是 7B 稠密模型：24 层、宽度 2048、16 个 Q heads / 4 个 KV heads、48 个路由专家（top-6）+ 2 个共享专家。激活 Transformer 参数约 1.35B，含 LM head 的激活矩阵约 1.42B。默认约 49.6B tokens 仅为首轮实验预算，不保证收敛或达到其他 7B 模型的能力。
+
+先完成上面的环境安装，并将 `NANOCHAT_BASE_DIR` 设在容量充足的持久化磁盘。参考硬件为单机 8×80GB CUDA GPU；所有参数和梯度仍在每卡复制，只有优化器状态分片，实际显存与速度必须先测。
+
+| 操作 | 命令 | 说明 |
+|---|---|---|
+| 模型预检查 | `bash runs/moe7b.sh check` | 默认模式；不下载语料、不分配 7B 权重、不训练 |
+| 准备语料与 tokenizer | `bash runs/moe7b.sh prepare` | 默认下载 1400 个训练分片，可用 `SHARDS` 调整；预留百 GB 级空间 |
+| 7B 冒烟验证 | `bash runs/moe7b.sh smoke` | 真实 7B 模型跑 5 步，每步一个 microbatch；保存至独立的 `moe7b-smoke` 标签 |
+| 正式预训练 | `bash runs/moe7b.sh train` | 不自动执行 SFT；默认 BF16、每卡 batch=1 |
+| 恢复预训练 | `RESUME_STEP=2000 bash runs/moe7b.sh train` | 架构、world size、Muon 桶大小和总 batch 必须与原训练一致 |
+| 评测 / SFT | `bash runs/moe7b.sh eval` / `bash runs/moe7b.sh sft` | SFT 继承分块 loss、激活重计算和优化器桶配置 |
+
+显存余量足够后，可将 `DEVICE_BATCH` 逐步调至 2 或 4；脚本自动用梯度累积维持 `TOTAL_BATCH`。`LOSS_CHUNK_SIZE=512` 限制单个 logits 块，`MUON_BUCKET_MB=128` 将大专家组拆桶并逐桶通信/更新。这两个设置以显存为优先，不保证更高吞吐。最小桶还受完整矩阵和 rank 对齐约束，128 MiB 不是整个优化器的硬显存上限。
+
+默认关闭 FP8；先取得 BF16 基线，再在支持的 GPU 上以 `FP8=1` 单独验证数值与速度。路由专家仍使用 BF16，未接入 grouped GEMM 或 expert parallelism。`NO_COMPILE=1` 可用于定位编译问题；无 FA3 时可先用 `WINDOW_PATTERN=L` 测试，注意这会改变模型窗口配置。
+
+模型 checkpoint 保持兼容；旧优化器 checkpoint 恢复须使用原 `MUON_BUCKET_MB`（旧版为 0），不能直接套用新桶布局。每个保存点的权重与全部优化器分片合计约 60GB，需为多次保存预留空间。数据恢复仍为 row-group 级近似恢复，并非逐 token 精确重放。正式训练前建议至少做数百步稳定性实验，依据 `val/bpb`、step time、显存峰值决定预算；不能仅按激活参数套用稠密模型缩放定律。
+
 ### Reproduce and talk to GPT-2
 
 The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:

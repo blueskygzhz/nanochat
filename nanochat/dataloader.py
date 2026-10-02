@@ -34,7 +34,8 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
 
     warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
     parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
-    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+    if len(parquet_paths) < 2:
+        raise ValueError("At least one training parquet and one validation parquet are required")
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
@@ -110,7 +111,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
-    use_cuda = device == "cuda"
+    use_cuda = torch.device(device).type == "cuda"
+    copy_done = torch.cuda.Event() if use_cuda else None
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
@@ -150,7 +152,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        # Copy to pinned CPU buffer, then single HtoD transfer
+        # Do not overwrite pinned memory until the previous asynchronous copy has finished.
+        if copy_done is not None:
+            copy_done.synchronize()
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
 
@@ -158,6 +162,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        if copy_done is not None:
+            copy_done.record(torch.cuda.current_stream(device))
         yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
