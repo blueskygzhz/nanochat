@@ -193,10 +193,12 @@ class MoEGate(nn.Module):
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
-        assert self.top_k <= self.n_routed_experts, f"top_k ({self.top_k}) > n_routed_experts ({self.n_routed_experts})"
+        assert 1 <= self.top_k <= self.n_routed_experts, "top_k must be in [1, n_routed_experts]"
         if self.topk_method == "group_limited_greedy":
+            assert self.n_group > 0, "n_group must be positive"
             assert self.n_routed_experts % self.n_group == 0, "n_routed_experts must be divisible by n_group"
-            assert self.topk_group <= self.n_group, "topk_group must be <= n_group"
+            assert 1 <= self.topk_group <= self.n_group, "topk_group must be in [1, n_group]"
+            assert self.top_k <= self.topk_group * (self.n_routed_experts // self.n_group), "selected groups contain fewer than top_k experts"
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.n_embd)))
 
     def forward(self, hidden_states):
@@ -242,8 +244,10 @@ class MoEGate(nn.Module):
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
                 # Global balance over all tokens: sum_i P_i * f_i
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
-                ce = mask_ce.float().mean(0)
+                assignments = topk_idx_for_aux_loss.reshape(-1)
+                counts = scores.new_zeros(self.n_routed_experts)
+                counts.scatter_add_(0, assignments, scores.new_ones(assignments.numel()))
+                ce = counts / assignments.numel()
                 Pi = scores.mean(0)
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha

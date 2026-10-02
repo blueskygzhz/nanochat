@@ -257,8 +257,9 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], memory_efficient=False):
         super().__init__(param_groups, defaults={})
+        self.memory_efficient = memory_efficient
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -463,6 +464,21 @@ class MuonAdamW(torch.optim.Optimizer):
         else:
             rank = 0
             world_size = 1
+
+        if self.memory_efficient:
+            for group in self.param_groups:
+                gathers = []
+                if group['kind'] == 'adamw':
+                    info = self._reduce_adamw(group, world_size)
+                    self._compute_adamw(group, info, gathers, rank, world_size)
+                elif group['kind'] == 'muon':
+                    info = self._reduce_muon(group, world_size)
+                    self._compute_muon(group, info, gathers, rank)
+                else:
+                    raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+                self._finish_gathers(gathers)
+                del info, gathers
+            return
 
         # Phase 1: launch all async reduce ops
         reduce_infos: list[dict] = []
