@@ -131,7 +131,7 @@ else:
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
+use_dummy_wandb = args.dry_run or args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
