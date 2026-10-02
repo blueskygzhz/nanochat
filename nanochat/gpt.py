@@ -37,6 +37,22 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # ---- Mixture-of-Experts, DeepSeek-V2 style ----
+    # n_routed_experts <= 0 => no MoE at all, every layer is a dense MLP (fully backward compatible).
+    # Reference config (DeepSeek-V2-Lite): 64 routed + 2 shared experts, top-6, moe_intermediate 1408/2048.
+    n_routed_experts: int = 0             # routed experts per MoE layer (0 => dense model)
+    n_shared_experts: int = 0             # always-on shared experts (0 => disabled)
+    num_experts_per_tok: int = 6          # top-k routed experts per token
+    moe_intermediate_mult: float = 0.6875 # expert FFN hidden = mult * n_embd (1408/2048 in V2-Lite)
+    first_k_dense_replace: int = 1        # the first K layers stay dense
+    moe_layer_freq: int = 1               # of the remaining layers, every moe_layer_freq-th is MoE
+    topk_method: str = "greedy"           # "greedy" | "group_limited_greedy"
+    n_group: int = 1                      # expert groups (for group_limited_greedy)
+    topk_group: int = 1                   # groups kept per token (for group_limited_greedy)
+    norm_topk_prob: bool = False          # renormalize top-k weights to sum to 1
+    routed_scaling_factor: float = 1.0    # scales routed output when norm_topk_prob is False
+    aux_loss_alpha: float = 0.001         # load-balancing auxiliary loss weight
+    seq_aux: bool = True                  # per-sequence aux loss (vs global over all tokens)
 
 
 def norm(x):
@@ -129,10 +145,12 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    """Dense FFN, also used as the body of every MoE expert (DeepSeek reuses one MLP class too)."""
+    def __init__(self, config, intermediate_size=None):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden = 4 * config.n_embd if intermediate_size is None else intermediate_size
+        self.c_fc = Linear(config.n_embd, hidden, bias=False)
+        self.c_proj = Linear(hidden, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -141,11 +159,154 @@ class MLP(nn.Module):
         return x
 
 
+def moe_intermediate_size(config):
+    """Expert FFN hidden dim: mult * n_embd, rounded up to a multiple of 128 for tensor cores."""
+    hidden = int(round(config.moe_intermediate_mult * config.n_embd))
+    return max(128, -(-hidden // 128) * 128)
+
+
+def is_moe_layer(layer_idx, config):
+    """DeepSeek-V2 layer placement: dense for the first K layers, then every moe_layer_freq-th layer."""
+    return (config.n_routed_experts > 0
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0)
+
+
+class MoEGate(nn.Module):
+    """
+    Router ("gate") of a MoE layer, mirroring DeepSeek-V2's MoEGate.
+
+    Returns (topk_idx, topk_weight, aux_loss). Scores are always computed in fp32.
+    The weight is a raw nn.Parameter (not our Linear) on purpose: it keeps routing out
+    of the FP8 conversion pass and out of the Muon matrix groups, both of which would
+    hurt a tiny, precision-sensitive matrix.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+        self.topk_method = config.topk_method
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+        assert self.top_k <= self.n_routed_experts, f"top_k ({self.top_k}) > n_routed_experts ({self.n_routed_experts})"
+        if self.topk_method == "group_limited_greedy":
+            assert self.n_routed_experts % self.n_group == 0, "n_routed_experts must be divisible by n_group"
+            assert self.topk_group <= self.n_group, "topk_group must be <= n_group"
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.n_embd)))
+
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        # Gating scores in fp32 for a numerically stable softmax regardless of activation dtype
+        logits = F.linear(hidden_states.float(), self.weight.float(), None)  # (N, E)
+        scores = logits.softmax(dim=-1, dtype=torch.float32)
+
+        # Select top-k experts
+        if self.topk_method == "greedy":
+            topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        elif self.topk_method == "group_limited_greedy":
+            # Score each group by its best expert, keep topk_group groups, then top-k within them
+            group_scores = scores.view(bsz * seq_len, self.n_group, -1).max(dim=-1).values  # (N, n_group)
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+            score_mask = group_mask.unsqueeze(-1).expand(
+                bsz * seq_len, self.n_group, self.n_routed_experts // self.n_group
+            ).reshape(bsz * seq_len, -1)
+            tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)
+            topk_weight, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
+        else:
+            raise NotImplementedError(f"unsupported topk_method: {self.topk_method}")
+
+        # Normalize gate weights to sum to 1, or else apply the routed scaling factor
+        if self.top_k > 1 and self.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        else:
+            topk_weight = topk_weight * self.routed_scaling_factor
+
+        # Expert-level load-balancing auxiliary loss (training only)
+        if self.training and self.alpha > 0.0:
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                # Per-sequence balance: dispatch fractions within each sequence, then averaged over the batch
+                scores_for_seq_aux = scores.view(bsz, seq_len, -1)
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                ce.scatter_add_(
+                    1, topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * self.top_k, device=hidden_states.device),
+                ).div_(seq_len * self.top_k / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+            else:
+                # Global balance over all tokens: sum_i P_i * f_i
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                ce = mask_ce.float().mean(0)
+                Pi = scores.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = None
+        return topk_idx, topk_weight, aux_loss
+
+
+class MoE(nn.Module):
+    """
+    DeepSeek-V2 style MoE layer: n_routed_experts routed via top-k, plus optional
+    always-on shared experts. Drop-in replacement for MLP.
+
+    Deviation from DeepSeek's reference code (deliberate): instead of injecting the
+    auxiliary loss through an AddAuxiliaryLoss autograd hack, we stash it on
+    self.aux_loss and GPT.forward adds it to the main loss. The hack hard-codes an
+    incoming gradient of 1.0, which would ignore nanochat's `loss / grad_accum_steps`
+    scaling and silently over-weight the aux loss by grad_accum_steps.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.n_routed_experts = config.n_routed_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        inter = moe_intermediate_size(config)
+        self.experts = nn.ModuleList([MLP(config, intermediate_size=inter) for _ in range(self.n_routed_experts)])
+        self.gate = MoEGate(config)
+        # Shared experts are merged into one wider MLP, exactly as DeepSeek does
+        self.shared_experts = MLP(config, intermediate_size=inter * config.n_shared_experts) if config.n_shared_experts > 0 else None
+        self.aux_loss = None  # set every training forward, collected by GPT.forward
+
+    def forward(self, x):
+        identity = x
+        B, T, C = x.shape
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        self.aux_loss = aux_loss
+        x_flat = x.view(-1, C)
+        y = self._dispatch(x_flat, topk_idx, topk_weight).view(B, T, C)
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(identity)
+        return y
+
+    def _dispatch(self, x_flat, topk_idx, topk_weight):
+        """Run each expert on just the tokens routed to it, then scatter-add weighted outputs.
+
+        Equivalent to DeepSeek's train path (repeat_interleave + per-expert mask) and its
+        moe_infer path (sort by expert), but without materializing k copies of the input.
+        """
+        out = torch.zeros_like(x_flat)
+        topk_weight = topk_weight.to(x_flat.dtype)
+        for e, expert in enumerate(self.experts):
+            mask = topk_idx == e                             # (N, k)
+            if not mask.any():
+                continue                                      # no token picked this expert
+            tok_idx, slot = mask.nonzero(as_tuple=True)       # which tokens, and in which slot
+            w = topk_weight[tok_idx, slot].unsqueeze(-1)      # (M, 1)
+            out.index_add_(0, tok_idx, expert(x_flat[tok_idx]) * w)
+        return out
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MoE(config) if is_moe_layer(layer_idx, config) else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -228,8 +389,19 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, MoE):
+                # Every expert (routed and shared) mirrors the dense MLP init
+                experts = list(block.mlp.experts)
+                if block.mlp.shared_experts is not None:
+                    experts.append(block.mlp.shared_experts)
+                for expert in experts:
+                    torch.nn.init.uniform_(expert.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                    torch.nn.init.zeros_(expert.c_proj.weight)
+                # Router: bound = 1/sqrt(fan_in), i.e. exactly DeepSeek's kaiming_uniform_(a=sqrt(5))
+                torch.nn.init.uniform_(block.mlp.gate.weight, -(n_embd**-0.5), n_embd**-0.5)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -335,17 +507,27 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        num_flops_per_token = 6 * self.num_matmul_params(active=True) + attn_flops
         return num_flops_per_token
 
-    def num_matmul_params(self):
+    def num_matmul_params(self, active=False):
         """
         The number of parameters that participate in matmuls with the token stream,
         i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
         matmul in this model goes through the Linear class, while non-matmul params
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
+
+        active=True counts only the params a single token actually flows through, which
+        for a MoE layer is top_k of n_routed_experts (plus the always-on shared experts).
+        Use active=True for any FLOPs/MFU math, total for memory/checkpoint math.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        if active:
+            for block in self.transformer.h:
+                if isinstance(block.mlp, MoE):
+                    routed = sum(p.numel() for e in block.mlp.experts for p in (e.c_fc.weight, e.c_proj.weight))
+                    n, k = block.mlp.n_routed_experts, block.mlp.num_experts_per_tok
+                    matmul_params -= round(routed * (n - k) / n) # skipped (inactive) experts
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
@@ -368,7 +550,7 @@ class GPT(nn.Module):
             w = min(window, num_tokens)
             attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
             attn_flops += 4 * h * q * attended_tokens
-        prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
+        prefill_flops = 2 * self.num_matmul_params(active=True) * num_tokens + attn_flops
         return prefill_flops
 
     def kv_bytes_per_token(self):
@@ -407,27 +589,42 @@ class GPT(nn.Module):
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        # For MoE models, the params a single token actually flows through ("active" / sparse count).
+        # Identical to transformer_matrices for dense models.
+        inactive = 0
+        for block in self.transformer.h:
+            if isinstance(block.mlp, MoE):
+                routed = sum(p.numel() for e in block.mlp.experts for p in (e.c_fc.weight, e.c_proj.weight))
+                n, k = block.mlp.n_routed_experts, block.mlp.num_experts_per_tok
+                inactive += round(routed * (n - k) / n)
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'transformer_matrices_active': transformer_matrices - inactive,
             'scalars': scalars,
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, router_lr=None):
         model_dim = self.config.n_embd
 
+        # MoE routers get AdamW, not Muon: they are tiny (n_experts x n_embd), and orthogonalized
+        # updates make little sense for a routing matrix. Also keeps them out of the shape-stacked
+        # Muon groups. No weight decay (decaying the router just drags routing back to uniform).
+        router_params = [m.weight for m in self.modules() if isinstance(m, MoEGate)]
+        router_ids = {id(p) for p in router_params}
+
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in router_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(router_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -443,6 +640,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if router_params:
+            lr = (matrix_lr if router_lr is None else router_lr) * dmodel_lr_scale
+            param_groups.append(dict(kind='adamw', params=router_params, lr=lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -455,6 +655,15 @@ class GPT(nn.Module):
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
+
+    def collect_aux_loss(self):
+        """Sum the MoE load-balancing aux losses stashed by the most recent forward.
+        Returns None for dense models or in eval mode. Also useful for logging it separately."""
+        aux = None
+        for block in self.transformer.h:
+            if isinstance(block.mlp, MoE) and block.mlp.aux_loss is not None:
+                aux = block.mlp.aux_loss if aux is None else aux + block.mlp.aux_loss
+        return aux
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
@@ -518,6 +727,13 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Add the MoE load-balancing auxiliary loss (only non-None while training a MoE model).
+            # Only for 'mean': with 'none' the caller wants per-token values (RL, bpb eval) and a
+            # scalar would broadcast into every element; with 'sum' the scales don't match.
+            if loss_reduction == 'mean':
+                aux = self.collect_aux_loss()
+                if aux is not None:
+                    loss = loss + aux.to(loss.dtype)
             return loss
         else:
             # inference: just return the logits directly

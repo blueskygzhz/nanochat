@@ -52,6 +52,20 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Mixture-of-Experts (DeepSeek-V2 style). n-routed-experts=0 => dense model (default)
+parser.add_argument("--n-routed-experts", type=int, default=0, help="routed experts per MoE layer (0 = dense model)")
+parser.add_argument("--n-shared-experts", type=int, default=0, help="always-on shared experts per MoE layer (0 = disabled)")
+parser.add_argument("--num-experts-per-tok", type=int, default=6, help="top-k routed experts per token")
+parser.add_argument("--moe-intermediate-mult", type=float, default=0.6875, help="expert FFN hidden = mult * n_embd")
+parser.add_argument("--first-k-dense-replace", type=int, default=1, help="keep the first K layers dense")
+parser.add_argument("--moe-layer-freq", type=int, default=1, help="of the remaining layers, every Nth is MoE")
+parser.add_argument("--topk-method", type=str, default="greedy", choices=["greedy", "group_limited_greedy"], help="expert selection method")
+parser.add_argument("--n-group", type=int, default=1, help="expert groups for group_limited_greedy")
+parser.add_argument("--topk-group", type=int, default=1, help="groups kept per token for group_limited_greedy")
+parser.add_argument("--norm-topk-prob", action="store_true", help="renormalize top-k gate weights to sum to 1")
+parser.add_argument("--routed-scaling-factor", type=float, default=1.0, help="scales routed output when --norm-topk-prob is off")
+parser.add_argument("--aux-loss-alpha", type=float, default=0.001, help="MoE load-balancing aux loss weight")
+parser.add_argument("--no-seq-aux", action="store_true", help="use global (not per-sequence) aux loss")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +151,12 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
+        num_experts_per_tok=args.num_experts_per_tok, moe_intermediate_mult=args.moe_intermediate_mult,
+        first_k_dense_replace=args.first_k_dense_replace, moe_layer_freq=args.moe_layer_freq,
+        topk_method=args.topk_method, n_group=args.n_group, topk_group=args.topk_group,
+        norm_topk_prob=args.norm_topk_prob, routed_scaling_factor=args.routed_scaling_factor,
+        aux_loss_alpha=args.aux_loss_alpha, seq_aux=not args.no_seq_aux,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
