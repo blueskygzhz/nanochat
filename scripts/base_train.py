@@ -50,6 +50,8 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--n-kv-head", type=int, default=-1, help="number of KV heads for GQA (-1 = same as query heads, i.e. MHA)")
+parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to save activation memory (needed for ~7B)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Mixture-of-Experts (DeepSeek-V2 style). n-routed-experts=0 => dense model (default)
@@ -147,9 +149,12 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    num_kv_heads = num_heads if args.n_kv_head <= 0 else min(args.n_kv_head, num_heads)
+    if num_heads % num_kv_heads != 0:
+        num_kv_heads = num_heads  # e.g. the d12 reference model may not divide; fall back to MHA
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
         num_experts_per_tok=args.num_experts_per_tok, moe_intermediate_mult=args.moe_intermediate_mult,
@@ -169,6 +174,12 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+model.activation_checkpointing = args.activation_checkpointing
+if args.activation_checkpointing:
+    print0("✓ Activation checkpointing enabled (per Block)")
+# The router weight (n_routed_experts, n_embd) is reduce_scattered along dim 0 by MuonAdamW
+if args.n_routed_experts > 0 and ddp_world_size > 1:
+    assert args.n_routed_experts % ddp_world_size == 0, f"--n-routed-experts ({args.n_routed_experts}) must be divisible by world size ({ddp_world_size})"
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -197,6 +208,11 @@ if args.fp8:
         # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
         def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
+                return False
+            # Routed experts see a variable token count M; the grad_weight GEMM in FP8 backward
+            # contracts over M and _scaled_mm requires that to be a multiple of 16 => would crash.
+            # (Shared experts see all tokens, so they are fine and stay eligible.)
+            if ".experts." in fqn:
                 return False
             if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
                 return False
@@ -282,8 +298,11 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 # We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
 def get_scaling_params(m):
     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
+    # For MoE we use the *active* matrices: compute (and hence the data budget) follows what a token
+    # actually flows through. Using the total count would inflate a 7B/1.3B-active MoE horizon ~5x.
+    # For dense models active == total, so this is a no-op there.
     params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    scaling_params = params_counts['transformer_matrices_active'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
@@ -530,6 +549,8 @@ while True:
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
+        aux = orig_model.collect_aux_loss() # MoE load-balancing loss (already included in `loss`), None for dense
+        train_aux = aux.detach() if aux is not None else None
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -559,6 +580,8 @@ while True:
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_aux_f = train_aux.item() if train_aux is not None else 0.0
+    train_loss_f -= train_aux_f # log pure cross-entropy so curves stay comparable with dense runs
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -584,7 +607,8 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    aux_str = f" | aux: {train_aux_f:.5f}" if train_aux is not None else ""
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{aux_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -597,6 +621,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if train_aux is not None:
+            log_data["train/aux_loss"] = train_aux_f
         wandb_run.log(log_data)
 
     # state update

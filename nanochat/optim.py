@@ -271,11 +271,40 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
+    @staticmethod
+    def _grad(p: Tensor) -> Tensor:
+        """Gradient of p, or zeros if it never got one this step.
+
+        A MoE expert that no token was routed to is absent from the autograd graph, so
+        p.grad stays None. Treating that as a zero gradient is both mathematically right
+        (the expert did not contribute to the loss) and required under DDP: routing differs
+        per rank, so every rank must still join the collectives with matching shapes or
+        training deadlocks.
+        """
+        return p.grad if p.grad is not None else torch.zeros_like(p)
+
+    @staticmethod
+    def _stack_grads_into(params: list, out: Tensor) -> None:
+        """Copy each param's grad into out[i] and free p.grad right away.
+
+        The naive torch.stack + copy keeps three copies of a group's gradients alive (p.grad,
+        the stack, the padded comm buffer). For a 7B MoE the expert groups alone are >10GB each
+        and all reduces are in flight at once, so that OOMs an 80GB card. Freeing p.grad as we
+        go keeps peak memory at ~one gradient copy. (The training loop zeroes grads after step
+        anyway, and nothing reads p.grad of Muon params after this point.)
+        """
+        for i, p in enumerate(params):
+            if p.grad is None:
+                out[i].zero_()
+            else:
+                out[i].copy_(p.grad)
+                p.grad = None
+
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
         param_infos = {}
         for p in group['params']:
-            grad = p.grad
+            grad = self._grad(p)
             if world_size == 1:
                 # Single rank: no communication, update the full param in place
                 param_infos[p] = dict(future=None, grad_slice=grad, is_small=True)
@@ -295,19 +324,19 @@ class MuonAdamW(torch.optim.Optimizer):
     def _reduce_muon(self, group: dict, world_size: int) -> dict:
         """Launch async reduce op for Muon group. Returns info dict."""
         params = group['params']
+        p = params[0]
+        shape, device, dtype = p.shape, p.device, p.dtype
         if world_size == 1:
             # Single rank: this rank owns all params, the stacked grads are the "chunk"
-            grad_chunk = torch.stack([p.grad for p in params])
+            grad_chunk = torch.empty(len(params), *shape, dtype=dtype, device=device)
+            self._stack_grads_into(params, grad_chunk)
             return dict(future=None, grad_chunk=grad_chunk, stacked_grads=None, chunk_size=len(params))
         chunk_size = (len(params) + world_size - 1) // world_size
         padded_num_params = chunk_size * world_size
-        p = params[0]
-        shape, device, dtype = p.shape, p.device, p.dtype
 
-        # Stack grads and zero-pad to padded_num_params
-        grad_stack = torch.stack([p.grad for p in params])
+        # Stack grads (directly into the comm buffer) and zero-pad to padded_num_params
         stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
+        self._stack_grads_into(params, stacked_grads)
         if len(params) < padded_num_params:
             stacked_grads[len(params):].zero_()
 

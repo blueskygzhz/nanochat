@@ -47,6 +47,7 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="number of op
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
+parser.add_argument("--activation-checkpointing", type=int, default=-1, help="1=on, 0=off, -1=inherit from pretrain")
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
@@ -113,6 +114,11 @@ for name, fallback, source in [
         print0(f"NOTE: --{name.replace('_', '-')}={arg_val} overrides pretrained value of {pretrain_val}")
     else:
         print0(f"Using {name}={arg_val}")
+
+if args.activation_checkpointing < 0:
+    args.activation_checkpointing = int(bool(pretrain_user_config.get("activation_checkpointing", False)))
+model.activation_checkpointing = bool(args.activation_checkpointing)
+print0(f"Activation checkpointing: {model.activation_checkpointing}")
 
 orig_model = model
 model = torch.compile(model, dynamic=False)

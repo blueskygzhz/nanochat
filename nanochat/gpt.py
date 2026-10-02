@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -284,22 +285,31 @@ class MoE(nn.Module):
             y = y + self.shared_experts(identity)
         return y
 
+    # Excluded from torch.compile on purpose: per-expert token counts change every step, so
+    # under dynamic=False each new shape would trigger a recompile (until the cache limit is
+    # hit and dynamo silently falls back to eager anyway). Everything around it still compiles.
+    @torch.compiler.disable
     def _dispatch(self, x_flat, topk_idx, topk_weight):
-        """Run each expert on just the tokens routed to it, then scatter-add weighted outputs.
+        """Sort (token, slot) pairs by expert, run each expert on one contiguous slice, scatter back.
 
-        Equivalent to DeepSeek's train path (repeat_interleave + per-expert mask) and its
-        moe_infer path (sort by expert), but without materializing k copies of the input.
+        Same math as DeepSeek's moe_infer path. Exactly one GPU->CPU sync per layer (the
+        per-expert counts), instead of one per expert. Experts that receive no tokens are not
+        called at all, so their .grad stays None (handled by MuonAdamW._grad).
         """
-        out = torch.zeros_like(x_flat)
-        topk_weight = topk_weight.to(x_flat.dtype)
-        for e, expert in enumerate(self.experts):
-            mask = topk_idx == e                             # (N, k)
-            if not mask.any():
-                continue                                      # no token picked this expert
-            tok_idx, slot = mask.nonzero(as_tuple=True)       # which tokens, and in which slot
-            w = topk_weight[tok_idx, slot].unsqueeze(-1)      # (M, 1)
-            out.index_add_(0, tok_idx, expert(x_flat[tok_idx]) * w)
-        return out
+        N, k = topk_idx.shape
+        flat_expert = topk_idx.reshape(-1)                         # (N*k,) expert id of each (token, slot)
+        order = flat_expert.argsort(stable=True)                   # group pairs by expert
+        tok_idx = order // k                                       # source token of each sorted pair
+        w = topk_weight.reshape(-1)[order].to(x_flat.dtype).unsqueeze(-1)  # (N*k, 1)
+        counts = torch.bincount(flat_expert, minlength=self.n_routed_experts).tolist()  # the one sync
+        xs = x_flat[tok_idx]                                       # (N*k, C) tokens in expert order
+        ys, start = [], 0
+        for e, c in enumerate(counts):
+            if c > 0:
+                ys.append(self.experts[e](xs[start:start + c]))
+                start += c
+        y = torch.cat(ys, dim=0) * w
+        return torch.zeros_like(x_flat).index_add_(0, tok_idx, y)
 
 
 class Block(nn.Module):
@@ -360,6 +370,9 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        # Activation checkpointing (runtime flag, not part of the config/checkpoint): recompute each
+        # Block in backward instead of storing its activations. ~30% slower, needed for big models.
+        self.activation_checkpointing = False
 
     @torch.no_grad()
     def init_weights(self):
@@ -538,7 +551,7 @@ class GPT(nn.Module):
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
-        decode_flops = 2 * self.num_matmul_params() + attn_flops
+        decode_flops = 2 * self.num_matmul_params(active=True) + attn_flops
         return decode_flops
 
     def estimate_prefill_flops(self, num_tokens):
@@ -705,10 +718,15 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        use_ckpt = self.activation_checkpointing and self.training and kv_cache is None and torch.is_grad_enabled()
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if use_ckpt:
+                # Routing is deterministic given the inputs, so the recompute picks the same experts
+                x = torch.utils.checkpoint.checkpoint(block, x, ve, cos_sin, self.window_sizes[i], None, use_reentrant=False)
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

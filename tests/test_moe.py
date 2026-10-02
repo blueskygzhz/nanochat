@@ -347,16 +347,49 @@ def test_optimizer_step_updates_moe_params():
 
     moe = next(b.mlp for b in model.transformer.h if isinstance(b.mlp, MoE))
     router_before = moe.gate.weight.detach().clone()
-    expert_before = moe.experts[0].c_fc.weight.detach().clone()
+    # NOTE: c_proj is zero-initialized (repo-wide convention), so on the very first step
+    # c_fc receives exactly zero gradient. c_proj is what moves first.
+    proj_before = moe.experts[0].c_proj.weight.detach().clone()
+    fc_before = moe.experts[0].c_fc.weight.detach().clone()
 
-    idx = torch.randint(0, config.vocab_size, (2, 16))
-    targets = torch.randint(0, config.vocab_size, (2, 16))
-    model(idx, targets).backward()
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+    def train_step():
+        idx = torch.randint(0, config.vocab_size, (2, 16))
+        targets = torch.randint(0, config.vocab_size, (2, 16))
+        model(idx, targets).backward()
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
 
+    train_step()
     assert not torch.equal(router_before, moe.gate.weight), "router did not update"
-    assert not torch.equal(expert_before, moe.experts[0].c_fc.weight), "expert did not update"
+    assert not torch.equal(proj_before, moe.experts[0].c_proj.weight), "expert c_proj did not update"
+
+    train_step()  # now c_proj != 0, so gradient can flow back into c_fc
+    assert not torch.equal(fc_before, moe.experts[0].c_fc.weight), "expert c_fc did not update"
+
+
+def test_optimizer_handles_experts_that_received_no_tokens():
+    """An unrouted expert is absent from the graph (p.grad is None); the optimizer must cope.
+
+    Regression test: Muon stacks p.grad across a shape group, which used to crash on None.
+    """
+    torch.manual_seed(0)
+    # Many experts, very few tokens => several experts are guaranteed to get nothing
+    config = make_config(n_layer=2, n_routed_experts=16, num_experts_per_tok=1, n_shared_experts=0)
+    model = build_model(config)
+    model.train()
+    optimizer = model.setup_optimizer()
+
+    idx = torch.randint(0, config.vocab_size, (1, 4))  # only 4 tokens for 16 experts
+    targets = torch.randint(0, config.vocab_size, (1, 4))
+    model(idx, targets).backward()
+
+    moe = next(b.mlp for b in model.transformer.h if isinstance(b.mlp, MoE))
+    missing = [e for e, ex in enumerate(moe.experts) if ex.c_fc.weight.grad is None]
+    assert missing, "test setup failed: expected at least one expert with no gradient"
+
+    optimizer.step()  # must not raise
+    model.zero_grad(set_to_none=True)
+    assert all(torch.isfinite(p).all() for p in model.parameters())
 
 
 def test_init_weights_zeroes_expert_output_projections():
@@ -370,6 +403,36 @@ def test_init_weights_zeroes_expert_output_projections():
             # router is small-random (kaiming a=sqrt(5) equivalent), not zero
             w = block.mlp.gate.weight
             assert w.abs().sum() > 0 and w.abs().max() <= config.n_embd ** -0.5 + 1e-6
+
+
+def test_activation_checkpointing_matches_plain_backward():
+    """Recomputing blocks in backward must give identical loss and gradients (routing is deterministic)."""
+    torch.manual_seed(0)
+    config = make_config(n_layer=4, aux_loss_alpha=0.01)
+    model = build_model(config)
+    for block in model.transformer.h:  # make c_proj non-zero so every param gets a real gradient
+        mlps = list(block.mlp.experts) + [block.mlp.shared_experts] if isinstance(block.mlp, MoE) else [block.mlp]
+        for m in mlps:
+            torch.nn.init.normal_(m.c_proj.weight, std=0.05)
+        torch.nn.init.normal_(block.attn.c_proj.weight, std=0.05)
+    model.train()
+    idx = torch.randint(0, config.vocab_size, (2, 16))
+    targets = torch.randint(0, config.vocab_size, (2, 16))
+
+    def run(ckpt):
+        model.zero_grad(set_to_none=True)
+        model.activation_checkpointing = ckpt
+        loss = model(idx, targets)
+        loss.backward()
+        grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        return loss.detach(), grads
+
+    loss_a, grads_a = run(False)
+    loss_b, grads_b = run(True)
+    torch.testing.assert_close(loss_a, loss_b)
+    assert grads_a.keys() == grads_b.keys()
+    for n in grads_a:
+        torch.testing.assert_close(grads_a[n], grads_b[n], rtol=1e-4, atol=1e-6, msg=n)
 
 
 def test_generate_works_with_moe():
