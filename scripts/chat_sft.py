@@ -51,6 +51,7 @@ parser.add_argument("--activation-checkpointing", type=int, default=-1, help="1=
 parser.add_argument("--loss-chunk-size", type=int, default=None, help="LM-head loss chunk size (default: inherit)")
 parser.add_argument("--muon-bucket-mb", type=int, default=None, help="Muon bucket target in MiB (default: inherit)")
 parser.add_argument("--no-compile", action="store_true", help="disable model compilation")
+parser.add_argument("--mtp-loss-weight", type=float, default=None, help="MTP auxiliary weight (default: inherit; requires an MTP checkpoint)")
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
@@ -92,6 +93,14 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sf
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+if args.mtp_loss_weight is not None:
+    if not model.config.mtp_enabled:
+        raise ValueError('--mtp-loss-weight requires a checkpoint trained with --mtp')
+    if not 0 <= args.mtp_loss_weight < float('inf'):
+        raise ValueError('mtp-loss-weight must be finite and non-negative')
+    model.config.mtp_loss_weight = args.mtp_loss_weight
+if model.config.mtp_enabled:
+    print0(f'MTP auxiliary training enabled, weight={model.config.mtp_loss_weight}')
 if model.config.attention_type == "mla":
     print0("MLA: PyTorch SDPA training with latent-cache inference; no FlashMLA backend")
 elif not HAS_FA3:
@@ -324,6 +333,7 @@ progress = 0 # will go from 0 to 1 over the course of the epoch
 # Same shape as base_train but uses progress (0→1) instead of absolute step counts,
 # because SFT doesn't always know num_iterations in advance (dataset-driven stopping).
 def get_lr_multiplier(progress):
+    progress = min(max(progress, 0.0), 1.0)
     if progress < args.warmup_ratio:
         return (progress + 1e-8) / args.warmup_ratio
     elif progress <= 1.0 - args.warmdown_ratio:
@@ -436,6 +446,9 @@ while True:
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
+        train_mtp = orig_model.collect_mtp_loss()
+        if train_mtp is not None:
+            train_loss = train_loss - train_mtp
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -489,6 +502,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": current_epoch,
+            "train/mtp_loss": train_mtp.item() if train_mtp is not None else 0.0,
         })
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.

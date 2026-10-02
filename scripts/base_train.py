@@ -57,6 +57,8 @@ parser.add_argument("--kv-lora-rank", type=int, default=512, help="MLA joint KV 
 parser.add_argument("--qk-nope-head-dim", type=int, default=128, help="MLA non-rotary Q/K dimension per head")
 parser.add_argument("--qk-rope-head-dim", type=int, default=64, help="MLA decoupled rotary Q/K dimension (must be even)")
 parser.add_argument("--v-head-dim", type=int, default=128, help="MLA value dimension per head")
+parser.add_argument("--mtp", action="store_true", help="train a lightweight one-step token-conditioned MTP draft head")
+parser.add_argument("--mtp-loss-weight", type=float, default=0.1, help="weight of the auxiliary next-next-token loss")
 parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to save activation memory (needed for ~7B)")
 parser.add_argument("--loss-chunk-size", type=int, default=0, help="tokens per checkpointed LM-head/loss chunk (0 = unchunked)")
 parser.add_argument("--muon-bucket-mb", type=int, default=0, help="Muon bucket target in MiB; >0 enables sequential low-memory updates (changes optimizer groups)")
@@ -105,6 +107,10 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.mtp and args.fp8:
+    parser.error('MTP training currently requires BF16/FP32 (shifted loss shapes are not FP8-aligned)')
+if not math.isfinite(args.mtp_loss_weight) or args.mtp_loss_weight < 0:
+    parser.error('mtp-loss-weight must be finite and non-negative')
 if args.loss_chunk_size < 0 or args.muon_bucket_mb < 0:
     parser.error("loss-chunk-size and muon-bucket-mb must be non-negative")
 if min(args.depth, args.aspect_ratio, args.head_dim, args.max_seq_len, args.device_batch_size) <= 0:
@@ -185,6 +191,8 @@ def build_model_meta(depth, reference=False):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        mtp_enabled=args.mtp, mtp_loss_weight=args.mtp_loss_weight,
+        mtp_bos_token_id=tokenizer.get_bos_token_id() if args.mtp and tokenizer is not None else -1,
         attention_type=args.attention_type, q_lora_rank=args.q_lora_rank, kv_lora_rank=args.kv_lora_rank,
         qk_nope_head_dim=args.qk_nope_head_dim, qk_rope_head_dim=args.qk_rope_head_dim, v_head_dim=args.v_head_dim,
         n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
@@ -610,7 +618,7 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    loss_stats = torch.zeros(2, device=device)
+    loss_stats = torch.zeros(3, device=device)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -619,6 +627,9 @@ while True:
         loss_stats[0].add_(train_loss)
         if train_aux is not None:
             loss_stats[1].add_(train_aux)
+        mtp_aux = orig_model.collect_mtp_loss()
+        if mtp_aux is not None:
+            loss_stats[2].add_(mtp_aux)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -629,10 +640,10 @@ while True:
     if is_ddp_initialized():
         dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
         loss_stats.div_(ddp_world_size)
-    train_total_f, train_aux_f = loss_stats.tolist()
-    if not math.isfinite(train_total_f) or not math.isfinite(train_aux_f):
+    train_total_f, train_aux_f, train_mtp_f = loss_stats.tolist()
+    if not all(math.isfinite(v) for v in (train_total_f, train_aux_f, train_mtp_f)):
         raise FloatingPointError(f"Non-finite training loss at step {step}; optimizer not updated")
-    train_loss_f = train_total_f - train_aux_f
+    train_loss_f = train_total_f - train_aux_f - train_mtp_f
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -681,6 +692,8 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     aux_str = f" | aux: {train_aux_f:.5f}" if train_aux is not None else ""
+    if args.mtp:
+        aux_str += f" | mtp: {train_mtp_f:.5f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{aux_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
@@ -696,6 +709,8 @@ while True:
         }
         if train_aux is not None:
             log_data["train/aux_loss"] = train_aux_f
+        if args.mtp:
+            log_data["train/mtp_loss"] = train_mtp_f
         wandb_run.log(log_data)
 
     # state update

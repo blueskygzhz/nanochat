@@ -19,6 +19,8 @@ NPROC=${NPROC:-8}
 ATTENTION_TYPE=${ATTENTION_TYPE:-gqa}
 DEFAULT_TAG=moe7b
 if [[ "$ATTENTION_TYPE" == mla ]]; then DEFAULT_TAG=moe7b-mla; fi
+MTP=${MTP:-0}
+if [[ "$MTP" == 1 ]]; then DEFAULT_TAG="${DEFAULT_TAG}-mtp"; fi
 MODEL_TAG=${MODEL_TAG:-$DEFAULT_TAG}
 WANDB_RUN=${WANDB_RUN:-dummy}
 DEVICE_BATCH=${DEVICE_BATCH:-1}
@@ -51,6 +53,7 @@ common=(
     --loss-chunk-size="$LOSS_CHUNK_SIZE" --muon-bucket-mb="$MUON_BUCKET_MB"
     --target-param-data-ratio="${PARAM_DATA_RATIO:-35}" --warmup-steps=500
 )
+if [[ "$MTP" == 1 ]]; then common+=(--mtp --mtp-loss-weight="${MTP_LOSS_WEIGHT:-0.1}"); fi
 if [[ "$FP8" == 1 ]]; then common+=(--fp8); fi
 if [[ "${NO_COMPILE:-0}" == 1 ]]; then common+=(--no-compile); fi
 launch=(python -m torch.distributed.run --standalone --nproc_per_node="$NPROC")

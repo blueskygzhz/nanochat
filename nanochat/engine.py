@@ -78,6 +78,18 @@ def use_calculator(expr):
     # Evaluate with timeout
     return eval_with_timeout(expr)
 
+def _truncate_cache(cache, length, prev_embedding):
+    """Discard speculative suffix and restore the normalized pre-smear embedding."""
+    if not 0 <= length <= cache.get_pos():
+        raise ValueError('Cannot extend a cache by truncating it')
+    if length > 0 and (prev_embedding is None or prev_embedding.shape[:2] != (cache.batch_size, 1)):
+        raise ValueError('Truncation requires the last retained token embedding')
+    cache.cache_seqlens.fill_(length)
+    if cache.attention_type == 'mla':
+        cache._pos = length
+    cache.prev_embedding = None if length == 0 else prev_embedding.detach().clone()
+
+
 # -----------------------------------------------------------------------------
 class KVCache:
     """
@@ -117,6 +129,9 @@ class KVCache:
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
         self.prev_embedding = None
+
+    def truncate(self, length, prev_embedding=None):
+        _truncate_cache(self, length, prev_embedding)
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -163,6 +178,9 @@ class MLAKVCache:
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         self.prev_embedding = None
         self._pos = 0
+
+    def truncate(self, length, prev_embedding=None):
+        _truncate_cache(self, length, prev_embedding)
 
     def get_pos(self):
         return self._pos
@@ -240,6 +258,24 @@ class RowState:
         self.python_expr_tokens = [] # Tokens of the current python expression
         self.completed = False # Whether this row has completed generation
 
+    def commit(self, token, tokenizer, special):
+        python_start, python_end, output_start, output_end, assistant_end, bos = special
+        self.current_tokens.append(token)
+        if token in (assistant_end, bos):
+            self.completed = True
+        if token == python_start:
+            self.in_python_block = True
+            self.python_expr_tokens = []
+        elif token == python_end and self.in_python_block:
+            self.in_python_block = False
+            if self.python_expr_tokens:
+                result = use_calculator(tokenizer.decode(self.python_expr_tokens))
+                if result is not None:
+                    self.forced_tokens.extend([output_start, *tokenizer.encode(str(result)), output_end])
+            self.python_expr_tokens = []
+        elif self.in_python_block:
+            self.python_expr_tokens.append(token)
+
 class Engine:
 
     def __init__(self, model, tokenizer):
@@ -247,9 +283,21 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42,
+                 speculative=False, stats=None):
+        """Generate tokens; speculative mode uses one MTP proposal and exact greedy verification."""
+        assert isinstance(tokens, list) and tokens and isinstance(tokens[0], int), "expecting non-empty list of ints"
+        if speculative:
+            if temperature != 0 or num_samples != 1:
+                raise ValueError('MTP speculative decoding supports only temperature=0 and num_samples=1')
+            if not getattr(self.model.config, 'mtp_enabled', False):
+                raise ValueError('Speculative decoding requires a checkpoint trained with --mtp')
+            if self.model.training:
+                raise ValueError('Speculative decoding requires model.eval()')
+            yield from self._generate_speculative(tokens, max_tokens, stats)
+            return
+        if max_tokens is not None and max_tokens <= 0:
+            return
         device = self.model.get_device()
         # Allocate the KV cache in the compute dtype so it matches what the forward pass emits
         dtype = COMPUTE_DTYPE
@@ -304,36 +352,78 @@ class Engine:
                 token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
                 next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
                 token_column.append(next_token)
-                # Update the state of this row to include the next token
-                state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
-                    state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
+                state.commit(next_token, self.tokenizer, (python_start, python_end, output_start, output_end, assistant_end, bos))
 
             # Yield the token column
             yield token_column, token_masks
             num_generated += 1
 
+            if all(state.completed for state in row_states) or (max_tokens is not None and num_generated >= max_tokens):
+                break
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
             logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+
+    @torch.inference_mode()
+    def _generate_speculative(self, tokens, max_tokens, stats):
+        """Verify [target token, one MTP proposal] together; never commit an unverified proposal."""
+        stats = {} if stats is None else stats
+        stats.clear()
+        stats.update(draft_calls=0, draft_tokens=0, accepted_draft_tokens=0, verification_calls=0,
+                     target_calls=0, target_tokens=0, generated_tokens=0, forced_tokens=0)
+        budget = max_tokens if max_tokens is not None else max(0, self.model.config.sequence_len - len(tokens))
+        if budget <= 0:
+            return
+        device = self.model.get_device()
+        special = tuple(self.tokenizer.encode_special(s) for s in
+                        ('<|python_start|>', '<|python_end|>', '<|output_start|>', '<|output_end|>', '<|assistant_end|>'))
+        special = (*special, self.tokenizer.get_bos_token_id())
+        tool_boundaries = special[:4]
+        cache = KVCache.from_config(self.model.config, 1, len(tokens) + budget, device, COMPUTE_DTYPE)
+        prompt = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits, hidden = self.model.forward_with_hidden(prompt, kv_cache=cache)
+        logits, hidden = logits[:, -1:], hidden[:, -1:]
+        stats['target_calls'] += 1
+        stats['target_tokens'] += len(tokens)
+        state = RowState(tokens.copy())
+        while stats['generated_tokens'] < budget and not state.completed:
+            forced = bool(state.forced_tokens)
+            token = state.forced_tokens.popleft() if forced else logits[0, -1].argmax().item()
+            state.commit(token, self.tokenizer, special)
+            stats['generated_tokens'] += 1
+            stats['forced_tokens'] += int(forced)
+            yield [token], [0 if forced else 1]
+            if state.completed or stats['generated_tokens'] >= budget:
+                return
+            ids = torch.tensor([[token]], dtype=torch.long, device=device)
+            draft = None
+            if not forced and not state.in_python_block and not state.forced_tokens and token not in tool_boundaries:
+                draft = self.model.mtp_logits(hidden, ids)[0, -1].argmax().item()
+                stats['draft_calls'] += 1
+                if draft in tool_boundaries:
+                    draft = None
+            if draft is None:
+                logits, hidden = self.model.forward_with_hidden(ids, kv_cache=cache)
+                stats['target_calls'] += 1
+                stats['target_tokens'] += 1
+                continue
+            pos = cache.get_pos()
+            pair = torch.tensor([[token, draft]], dtype=torch.long, device=device)
+            verified_logits, verified_hidden = self.model.forward_with_hidden(pair, kv_cache=cache)
+            stats['target_calls'] += 1
+            stats['target_tokens'] += 2
+            stats['verification_calls'] += 1
+            stats['draft_tokens'] += 1
+            accepted = draft == verified_logits[0, 0].argmax().item()
+            if accepted:
+                logits, hidden = verified_logits[:, 1:], verified_hidden[:, 1:]
+                state.commit(draft, self.tokenizer, special)
+                stats['accepted_draft_tokens'] += 1
+                stats['generated_tokens'] += 1
+                yield [draft], [1]
+            else:
+                cache.truncate(pos + 1, self.model.embed_tokens(ids))
+                logits, hidden = verified_logits[:, :1], verified_hidden[:, :1]
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

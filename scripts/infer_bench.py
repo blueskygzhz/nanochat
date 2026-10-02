@@ -81,6 +81,34 @@ def bench_generate(engine, prompt_tokens, batch_size, decode_tokens, temperature
     peak_vram = torch.cuda.max_memory_allocated(device)
     return dict(ttft=ttft, step_times=step_times, peak_vram=peak_vram)
 
+def bench_speculative(engine, prompt_tokens, decode_tokens, speculative):
+    """Time the whole stream, not per-yield latency (accepted drafts arrive in bursts)."""
+    device = engine.model.get_device()
+    cuda = device.type == 'cuda'
+    sync = (lambda: torch.cuda.synchronize(device)) if cuda else (lambda: None)
+    if cuda:
+        torch.cuda.reset_peak_memory_stats(device)
+    sync()
+    stats, output, masks = {}, [], []
+    start = time.perf_counter()
+    first_time = None
+    for column, mask in engine.generate(prompt_tokens, max_tokens=decode_tokens, temperature=0,
+                                       speculative=speculative, stats=stats):
+        output.append(column[0])
+        masks.append(mask[0])
+        if first_time is None:
+            sync()
+            first_time = time.perf_counter()
+    sync()
+    elapsed = time.perf_counter() - start
+    proposed = stats.get('draft_tokens', 0)
+    return dict(output_ids=output, masks=masks, generated_tokens=len(output),
+                elapsed_sec=elapsed, ttft_sec=None if first_time is None else first_time - start,
+                tokens_per_sec=len(output) / elapsed,
+                acceptance_rate=stats.get('accepted_draft_tokens', 0) / proposed if proposed else None,
+                stats=stats, peak_vram_bytes=torch.cuda.max_memory_allocated(device) if cuda else None)
+
+
 def build_prompt(tokenizer, num_tokens):
     """A natural-language prompt of exactly num_tokens tokens (random ids would
     do for speed, but a real prompt keeps argmax decoding from degenerating)."""
@@ -103,7 +131,12 @@ def main():
     parser.add_argument("--decode-tokens", type=int, default=256, help="Tokens to generate per row")
     parser.add_argument("--batch-sizes", type=str, default="1,8,32,128", help="Comma-separated decode batch sizes")
     parser.add_argument("-t", "--temperature", type=float, default=0.0)
+    parser.add_argument("--speculative", action="store_true", help="compare single-row greedy MTP decoding with baseline (ignores batch sweep)")
     args = parser.parse_args()
+    if args.speculative and args.temperature != 0:
+        parser.error('--speculative requires temperature=0')
+    if args.decode_tokens < 1 or args.prompt_tokens < 1:
+        parser.error('prompt-tokens and decode-tokens must be positive')
 
     device_type = autodetect_device_type()
     assert device_type == "cuda", "infer_bench currently assumes a CUDA GPU (for timing and VRAM measurement)"
@@ -116,10 +149,26 @@ def main():
 
     # Clamp the prompt so prompt + decode fits in the training context
     max_prompt = config.sequence_len - args.decode_tokens
+    if max_prompt < 1:
+        raise ValueError('decode-tokens must leave room for a prompt within sequence_len')
     prompt_len = min(args.prompt_tokens, max_prompt)
     if prompt_len < args.prompt_tokens:
         print(f"note: clamping prompt to {prompt_len} tokens so prompt+decode fits sequence_len={config.sequence_len}")
     prompt_tokens = build_prompt(tokenizer, prompt_len)
+    if args.speculative:
+        print('MTP comparison: single-row greedy; per-yield MFU/MBU are not applicable.')
+        for enabled in (False, True):
+            bench_speculative(engine, prompt_tokens, min(8, args.decode_tokens), enabled)
+        baseline = bench_speculative(engine, prompt_tokens, args.decode_tokens, False)
+        speculative = bench_speculative(engine, prompt_tokens, args.decode_tokens, True)
+        matched = (baseline['output_ids'] == speculative['output_ids'] and baseline['masks'] == speculative['masks'])
+        speedup = baseline['elapsed_sec'] / speculative['elapsed_sec'] if matched else None
+        print(json.dumps(dict(mode='mtp_greedy', source=args.source, model_config=meta['model_config'],
+                              outputs_match=matched, speedup=speedup, baseline=baseline, speculative=speculative)))
+        compute_cleanup()
+        if not matched:
+            raise RuntimeError('Greedy output mismatch; inspect chunk-vs-single-token numerical differences before claiming speedup')
+        return
 
     # ------------------------------------------------------------------------
     # Static card: inference cost implied by the architecture, before measuring

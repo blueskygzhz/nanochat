@@ -88,6 +88,32 @@ uv sync --extra gpu --group dev
 - **GQA checkpoint 不能直接当 MLA checkpoint 恢复**，也不支持直接导入官方 DeepSeek 权重。旧 GQA checkpoint 缺失这些字段时继续使用 GQA；切换 MLA 需要新训练或另行做转换/蒸馏。
 - 首版 MLA 注意力不参与本地 FP8 Linear 转换；`--fp8` 仍可作用于其他符合条件的层。尚未接入 FlashMLA、专用 Triton kernel、分页 KV 或张量并行。SDPA 能否选择高效 CUDA kernel 取决于硬件、维度和 mask；带滑窗的训练可能退回较慢路径。先测小模型数值和真实 GPU 显存/吞吐，再长跑。
 
+### 可选 MTP 训练与投机解码
+
+首版采用**单步、token 条件化的轻量 MTP 头**：`norm(h_t)` 与下一 token 的 embedding 拼接，经 `2d→d` 融合投影和残差 ReLU² MLP，使用共享 LM head 预测 `x_(t+2)`。这是本项目的辅助草稿头，不是 DeepSeek/HY3 的完整 Transformer MTP 层；没有额外的 MTP attention cache，也没有多层草稿树。
+
+默认关闭，使用 `MTP=1` 或 `scripts.base_train --mtp` 开启。默认辅助权重 0.1，可通过 `MTP_LOSS_WEIGHT` / `--mtp-loss-weight` 调整。训练目标为 `CE + MoE_aux + weight*MTP_CE`，MTP 梯度同时进入共享主干、embedding、LM head 和草稿头。行内移位后才展平，沿用 SFT 的 target mask；两步中任意一步为忽略位置或跨 BOS 边界时不计 MTP loss。分块损失会对整个草稿分支重计算；无有效辅助标签时返回图连接的零。评估以及 `loss_reduction='none'/'sum'` 不加入 MTP loss，BPB 和 RL 逐 token loss 不变。
+
+| 操作 | 命令 |
+|---|---|
+| GQA+MTP 预检查 | `MTP=1 bash runs/moe7b.sh check` |
+| MLA+MTP 预检查 | `ATTENTION_TYPE=mla MTP=1 bash runs/moe7b.sh check` |
+| 冒烟 / 正式预训练 | `MTP=1 bash runs/moe7b.sh smoke` / `MTP=1 bash runs/moe7b.sh train` |
+| SFT，继续训练已有 MTP 头 | `MTP=1 bash runs/moe7b.sh sft` |
+| 使用 SFT checkpoint 投机聊天 | `python -m scripts.chat_cli --model-tag=moe7b-mtp --temperature=0 --speculative` |
+| 对比普通与投机解码 | `python -m scripts.infer_bench -i sft -g moe7b-mtp --speculative --prompt-tokens=512 --decode-tokens=128` |
+
+启用时默认标签为 `moe7b-mtp` 或 `moe7b-mla-mtp`；对 MLA 的后续操作同样设置 `ATTENTION_TYPE=mla`。SFT 自动加载并训练草稿头，可用 `--mtp-loss-weight=0` 禁用辅助目标（这不是冻结共享主干）。旧 checkpoint 没有 MTP 参数时仍可普通推理，但不能直接加 `--speculative`；也不能将旧 optimizer 原样恢复为新增草稿头的模型。当前不提供旧模型的自动头迁移，需要从 MTP 配置开始训练。SFT 保存完整 MTP 配置和权重；RL 尚不继续训练 MTP 辅助目标。
+
+解码过程：主头从当前前缀确定 token `a`，MTP 根据该前缀隐藏态和 `a` 提议 `b`；主干一次处理 `[a,b]`，用 `a` 位置的主头 argmax 检验 `b`。接受则保留两个位置的缓存；拒绝则只保留 `a`，恢复 GQA/MLA 长度与 pre-smear embedding，下一步使用主头纠正 token。草稿从不绕过主模型验证。工具表达式、强制工具结果及工具边界走普通逐 token 路径；只对已提交的 token 执行工具状态变更。
+
+限制与性能：
+- 仅支持 `temperature=0`、`num_samples=1`、`model.eval()`；其他组合明确报错，普通采样不受影响。`max_tokens=None` 的投机路径使用训练上下文剩余长度作为预算。没有概率接受/拒绝采样、continuous batching、CUDA Graph 或多 GPU 专用投机调度。
+- 在相同主模型概率下保持 greedy 语义；不同长度 GEMM/attention 的浮点舍入可能影响近似并列 argmax，实际设备上应逐 token 对比。基准程序检查输出与 mask 相同，若不一致就不报告加速比。
+- `stats` 可记录草稿调用数、实际验证草稿数、接受数、验证调用数、主干处理 token 数、提交 token 数及强制 token 数。接受率是接受草稿数/验证草稿数，不含因工具边界跳过的提案；提交数包含终止标记和工具注入 token。基准按完整生成流计时，不把一次 yield 当成一次 GPU decode，也不套用普通解码 MFU/MBU 公式。
+- 首版 MTP 训练与 `--fp8` 组合会提前报错：移位后的 token 数不满足当前 FP8 backward 对齐约束。先使用 BF16/FP32。草稿头是否带来吞吐收益取决于训练后的接受率和硬件，不能因主干调用减少就保证加速。
+- 宽度 2048 时新增约 41.94M 参数；普通目标模型推理 FLOPs 不包含未执行的草稿头，训练 FLOPs 会额外计算草稿头和第二次 LM-head 投影。token 数据预算仍按主干 active 参数决定，不把辅助标签计作额外训练 token。
+
 ### Reproduce and talk to GPT-2
 
 The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:

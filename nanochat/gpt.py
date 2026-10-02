@@ -61,8 +61,15 @@ class GPTConfig:
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
+    mtp_enabled: bool = False
+    mtp_loss_weight: float = 0.1
+    mtp_bos_token_id: int = -1
 
     def __post_init__(self):
+        if not 0 <= self.mtp_loss_weight < float('inf'):
+            raise ValueError("mtp_loss_weight must be finite and non-negative")
+        if not -1 <= self.mtp_bos_token_id < self.vocab_size:
+            raise ValueError("mtp_bos_token_id must be -1 or a valid vocabulary ID")
         if self.attention_type not in ("gqa", "mla"):
             raise ValueError("attention_type must be gqa or mla")
         if self.attention_type == "mla":
@@ -349,6 +356,30 @@ class Block(nn.Module):
         return x
 
 
+class MTPHead(nn.Module):
+    """One-step MTP: fuse h_t and embedding(x_{t+1}) to predict x_{t+2}.
+
+    A lightweight residual MLP, not a DeepSeek/HY3 Transformer MTP layer.
+    Token embedding and output vocabulary projection are shared by the parent GPT.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.fuse = Linear(2 * config.n_embd, config.n_embd, bias=False)
+        self.mlp = MLP(config)
+
+    def forward(self, hidden, next_embedding):
+        x = self.fuse(torch.cat((norm(hidden), norm(next_embedding)), dim=-1))
+        return norm(x + self.mlp(norm(x)))
+
+    @torch.no_grad()
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                bound = (3 / m.in_features) ** 0.5
+                nn.init.uniform_(m.weight, -bound, bound)
+        nn.init.zeros_(self.mlp.c_proj.weight)
+
+
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -399,6 +430,8 @@ class GPT(nn.Module):
         # Block in backward instead of storing its activations. ~30% slower, needed for big models.
         self.activation_checkpointing = False
         self.loss_chunk_size = 0
+        self.mtp = MTPHead(config) if config.mtp_enabled else None
+        self.mtp_loss = None
 
     @torch.no_grad()
     def init_weights(self):
@@ -479,6 +512,8 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+        if self.mtp is not None:
+            self.mtp.init_weights()
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -529,6 +564,13 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def num_mtp_params(self):
+        return 0 if self.mtp is None else sum(p.numel() for p in self.mtp.parameters())
+
+    def estimate_mtp_flops(self):
+        """Forward FLOPs per draft, including its shared LM-head invocation."""
+        return 0 if self.mtp is None else 2 * (self.num_mtp_params() + self.lm_head.weight.numel())
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -541,9 +583,11 @@ class GPT(nn.Module):
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
+        mtp_flops = (3 * self.estimate_mtp_flops() * (self.config.sequence_len - 1) / self.config.sequence_len
+                     if self.mtp is not None and self.config.mtp_loss_weight > 0 else 0)
         if self.config.attention_type == "mla":
             # Model FLOPs: excludes checkpoint recomputation, SDPA padding and softmax.
-            return 3 * self.estimate_prefill_flops(self.config.sequence_len) / self.config.sequence_len
+            return 3 * self.estimate_prefill_flops(self.config.sequence_len) / self.config.sequence_len + mtp_flops
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -551,7 +595,7 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params(active=True) + attn_flops
+        num_flops_per_token = 6 * self.num_matmul_params(active=True) + attn_flops + mtp_flops
         return num_flops_per_token
 
     def num_matmul_params(self, active=False):
@@ -565,7 +609,8 @@ class GPT(nn.Module):
         for a MoE layer is top_k of n_routed_experts (plus the always-on shared experts).
         Use active=True for any FLOPs/MFU math, total for memory/checkpoint math.
         """
-        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, (nn.Linear, MoEGate)))
+        # MTP is not executed by ordinary target inference; its cost is reported separately.
+        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, (nn.Linear, MoEGate))) - self.num_mtp_params()
         if active:
             for block in self.transformer.h:
                 if isinstance(block.mlp, MoE):
@@ -648,7 +693,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        mtp = self.num_mtp_params()
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + mtp
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         # For MoE models, the params a single token actually flows through ("active" / sparse count).
         # Identical to transformer_matrices for dense models.
@@ -665,6 +711,7 @@ class GPT(nn.Module):
             'transformer_matrices': transformer_matrices,
             'transformer_matrices_active': transformer_matrices - inactive,
             'scalars': scalars,
+            'mtp': mtp,
             'total': total,
         }
 
@@ -683,6 +730,8 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in adamw_ids]
+        if self.mtp is not None:
+            matrix_params.extend(self.mtp.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -747,7 +796,12 @@ class GPT(nn.Module):
     def _loss_chunk(self, x, targets, reduction):
         return F.cross_entropy(self._compute_logits(x), targets, ignore_index=-1, reduction=reduction)
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def embed_tokens(self, idx):
+        """Normalized pre-smear embeddings, also needed when rolling back a KV cache."""
+        return norm(self.transformer.wte(idx).to(COMPUTE_DTYPE))
+
+    def forward_hidden(self, idx, kv_cache=None):
+        """Run only the target trunk, returning final normalized hidden states."""
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -770,9 +824,7 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
-        x = norm(x)
+        x = self.embed_tokens(idx)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
@@ -815,8 +867,56 @@ class GPT(nn.Module):
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        return norm(x)
 
+    def forward_with_hidden(self, idx, kv_cache=None):
+        hidden = self.forward_hidden(idx, kv_cache)
+        return self._compute_logits(hidden), hidden
+
+    def mtp_logits(self, hidden, next_ids):
+        if self.mtp is None:
+            raise ValueError('This model has no MTP head')
+        if hidden.shape[:-1] != next_ids.shape:
+            raise ValueError('MTP hidden states and next token IDs must align')
+        next_embedding = self.transformer.wte(next_ids).to(hidden.dtype)
+        return self._compute_logits(self.mtp(hidden, next_embedding))
+
+    def collect_mtp_loss(self):
+        """Detached, weighted MTP loss from the most recent training mean-loss forward."""
+        return self.mtp_loss
+
+    def _mtp_targets(self, idx, targets):
+        labels = targets[:, 1:].clone()
+        valid = (targets[:, :-1] >= 0) & (labels >= 0)
+        bos = self.config.mtp_bos_token_id
+        if bos >= 0:
+            valid = valid & (idx[:, 1:] != bos) & (labels != bos)
+        return labels.masked_fill(~valid, -1)
+
+    def _mtp_loss_chunk(self, hidden, next_ids, targets):
+        return F.cross_entropy(self.mtp_logits(hidden, next_ids), targets, ignore_index=-1, reduction='sum')
+
+    def _compute_mtp_loss(self, hidden, idx, targets):
+        # Shift inside each row before flattening; -1 labels are never used as embedding IDs.
+        labels = self._mtp_targets(idx, targets).reshape(-1)
+        h = hidden[:, :-1].reshape(-1, hidden.size(-1))
+        next_ids = idx[:, 1:].reshape(-1)
+        chunk_size = self.loss_chunk_size or max(1, labels.numel())
+        losses = []
+        for start in range(0, labels.numel(), chunk_size):
+            args = (h[start:start + chunk_size], next_ids[start:start + chunk_size], labels[start:start + chunk_size])
+            if self.loss_chunk_size > 0 and torch.is_grad_enabled():
+                part = torch.utils.checkpoint.checkpoint(self._mtp_loss_chunk, *args, use_reentrant=False)
+            else:
+                part = self._mtp_loss_chunk(*args)
+            losses.append(part)
+        if not losses:
+            return hidden.sum() * 0
+        return torch.stack(losses).sum() / (labels >= 0).sum().clamp_min(1)
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        self.mtp_loss = None
+        x = self.forward_hidden(idx, kv_cache)
         if targets is None:
             return self._compute_logits(x)
 
@@ -848,6 +948,10 @@ class GPT(nn.Module):
             aux = self.collect_aux_loss()
             if aux is not None:
                 loss = loss + aux.to(loss.dtype)
+            if self.training and kv_cache is None and self.mtp is not None and self.config.mtp_loss_weight > 0:
+                mtp_loss = self._compute_mtp_loss(x, idx, targets) * self.config.mtp_loss_weight
+                self.mtp_loss = mtp_loss.detach()
+                loss = loss + mtp_loss
         return loss
 
     @torch.inference_mode()

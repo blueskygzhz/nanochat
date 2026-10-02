@@ -19,7 +19,7 @@ def offline_training(monkeypatch, tmp_path):
     monkeypatch.setattr(common, 'compute_cleanup', lambda: None)
     monkeypatch.setattr(gc, 'freeze', lambda: None)
     monkeypatch.setattr(gc, 'disable', lambda: None)
-    fake_tokenizer = SimpleNamespace(get_vocab_size=lambda: 128)
+    fake_tokenizer = SimpleNamespace(get_vocab_size=lambda: 128, get_bos_token_id=lambda: 127)
     monkeypatch.setattr(tokenizer, 'get_tokenizer', lambda: fake_tokenizer)
     monkeypatch.setattr(checkpoints, 'get_tokenizer', lambda: fake_tokenizer)
     monkeypatch.setattr(tokenizer, 'get_token_bytes', lambda **_: torch.ones(128, dtype=torch.int32))
@@ -29,8 +29,8 @@ def offline_training(monkeypatch, tmp_path):
     def batches(tokenizer, batch_size, sequence_len, **kwargs):
         gen = torch.Generator().manual_seed(0)
         while True:
-            x = torch.randint(0, 128, (batch_size, sequence_len), generator=gen)
-            y = torch.randint(0, 128, (batch_size, sequence_len), generator=gen)
+            row = torch.randint(0, 127, (batch_size, sequence_len + 1), generator=gen)
+            x, y = row[:, :-1].contiguous(), row[:, 1:].contiguous()
             yield x, y, dict(pq_idx=0, rg_idx=0, epoch=1)
 
     monkeypatch.setattr(dataloader, 'tokenizing_distributed_data_loader_with_state_bos_bestfit', batches)
@@ -50,11 +50,14 @@ def offline_training(monkeypatch, tmp_path):
     return run, tmp_path / 'base_checkpoints' / 'unit'
 
 
+@pytest.mark.parametrize('mtp', [False, True])
 @pytest.mark.parametrize('attention', ['gqa', 'mla'])
-def test_training_save_resume_and_inference(offline_training, attention):
+def test_training_save_resume_and_inference(offline_training, attention, mtp):
     run, directory = offline_training
     arch = [f'--attention-type={attention}', '--q-lora-rank=16', '--kv-lora-rank=16',
             '--qk-nope-head-dim=12', '--qk-rope-head-dim=8', '--v-head-dim=10']
+    if mtp:
+        arch += ['--mtp', '--mtp-loss-weight=0.2']
     result = run(*arch)
     assert result['step'] == 2
     assert result['optimizer'].memory_efficient
@@ -65,6 +68,10 @@ def test_training_save_resume_and_inference(offline_training, attention):
     assert meta['world_size'] == 1
     assert meta['model_config']['n_routed_experts'] == 4
     assert meta['user_config']['loss_chunk_size'] == 8
+    assert meta['model_config']['mtp_enabled'] == mtp
+    if mtp:
+        assert meta['model_config']['mtp_bos_token_id'] == 127
+        assert result['train_mtp_f'] > 0
     loaded, _, _ = checkpoints.build_model(directory, 2, torch.device('cpu'), 'eval')
     assert not any(p.is_meta for p in loaded.parameters())
     assert not loaded.cos.is_meta
@@ -84,6 +91,49 @@ def test_resume_rejects_past_horizon_and_changed_buckets(offline_training):
         run('--resume-from-step=2', '--num-iterations=1')
     with pytest.raises(ValueError, match='muon-bucket-mb'):
         run('--resume-from-step=2', '--muon-bucket-mb=0')
+
+
+def test_sft_inherits_and_saves_trained_mtp(offline_training, monkeypatch):
+    from nanochat import loss_eval
+    from tasks import smoltalk, mmlu, gsm8k
+    run, base_directory = offline_training
+    result = run('--mtp')
+    before = result['orig_model'].mtp.fuse.weight.detach().clone()
+    fake_tokenizer = tokenizer.get_tokenizer()
+    fake_tokenizer.render_conversation = lambda conversation: ([127, 1, 2, 3, 4], [0, 0, 0, 1, 1])
+
+    class TinyTask:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __len__(self):
+            return 32
+        def __getitem__(self, index):
+            return {'messages': [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': 'a'}]}
+
+    monkeypatch.setattr(smoltalk, 'SmolTalk', TinyTask)
+    monkeypatch.setattr(mmlu, 'MMLU', TinyTask)
+    monkeypatch.setattr(gsm8k, 'GSM8K', TinyTask)
+    monkeypatch.setattr(loss_eval, 'evaluate_bpb', lambda *args: 0.5)
+    monkeypatch.setattr(sys, 'argv', ['chat_sft', '--device-type=cpu', '--no-compile', '--model-tag=unit',
+                                     '--num-iterations=2', '--chatcore-every=-1', '--eval-every=-1',
+                                     '--warmdown-ratio=0', '--mtp-loss-weight=0.3'])
+    trained = runpy.run_module('scripts.chat_sft', run_name='__main__')
+    assert trained['orig_model'].config.mtp_enabled
+    assert trained['orig_model'].config.mtp_loss_weight == 0.3
+    assert trained['orig_model'].loss_chunk_size == 8
+    assert trained['optimizer'].memory_efficient
+    assert not torch.equal(before, trained['orig_model'].mtp.fuse.weight)
+    directory = base_directory.parent.parent / 'chatsft_checkpoints' / 'unit'
+    step = checkpoints.find_last_step(directory)
+    loaded, _, meta = checkpoints.build_model(directory, step, torch.device('cpu'), 'eval')
+    assert meta['model_config']['mtp_enabled']
+    assert meta['model_config']['mtp_loss_weight'] == 0.3
+    trained['orig_model'].eval()
+    with torch.no_grad():
+        idx = torch.tensor([[1, 2, 3]])
+        hidden = loaded.forward_hidden(idx)
+        torch.testing.assert_close(loaded.mtp_logits(hidden[:, -1:], idx[:, -1:]),
+                                   trained['orig_model'].mtp_logits(hidden[:, -1:], idx[:, -1:]))
 
 
 def test_missing_training_shard_fails_instead_of_spinning(monkeypatch):
