@@ -1,27 +1,36 @@
 # nanochat (from scratch, no framework)
 
-This is a fork of [nanochat](https://github.com/karpathy/nanochat) with **PyTorch removed entirely**. Nothing here imports a deep learning framework. The autograd engine, the module system, the layers, the optimizers, the tokenizer and the model are all written out by hand.
+This is a fork of [nanochat](https://github.com/karpathy/nanochat) with **PyTorch removed entirely**. Nothing here imports a deep learning framework. The autograd engine, the module system, the layers, the optimizers, the tokenizer, the inference engine with KV caching, the evaluation metrics, and the model are all written out by hand.
 
 numpy is the only runtime dependency that does any math, and it supplies exactly two things: an n-dimensional array and a BLAS matrix multiply. It provides no automatic differentiation, no layers, no optimizers and no model — that is all code in this repo.
 
 ```bash
 uv sync --group dev
 source .venv/bin/activate
-python -m scripts.scratch_train
+bash runs/speedrun.sh   # the full pipeline: pretrain → eval → SFT → chat
 ```
 
 ```
-from-scratch nanochat | dense | 229,458 params | 126,000 train tokens
-task: 2-digit addition | entropy floor: 0.6579 nats/token | uniform-byte baseline: 5.5452
---------------------------------------------------------------------
-step    0 | train 5.5446 | val 5.5042 |    0.4s | gap to floor +4.8464
-step  100 | train 0.7795 | val 0.7681 |   11.3s | gap to floor +0.1103
-step  199 | train 0.6908 | val 0.6953 |   22.2s | gap to floor +0.0374
---------------------------------------------------------------------
-greedy addition accuracy: 17/20
+=== 1/4  Pretrain ===
+base_train | dense d4 w64 | 229,458 params | vocab 256
+step     0 | train 5.5446 | val bpb 7.83 |    0.4s
+step   399 | train 0.6813 | val bpb 0.999 |   34.7s
+
+=== 2/4  Evaluate the base model ===
+val bits per byte : 0.9994   (entropy floor 0.9491, gap +0.0502)
+addition (MC)     : 1.000    (chance 0.500, n=100)
+greedy exact match: 10/10
+
+=== 3/4  Finetune on conversations ===
+step   599 | train 0.0000 | val 0.0000 | exact match: 5/5
+
+=== 4/4  Talk to it ===
+You: 2+3   Bot: 5
+You: 7+8   Bot: 15
+You: 9+9   Bot: 18
 ```
 
-The loss starts at 5.5446, which is `ln(256)` — a model that knows nothing about bytes. It ends 0.037 nats above the information-theoretic floor of the task, in 22 seconds on one CPU core.
+Total wall time: ~2 minutes on one CPU core.
 
 ## Read this first: what this fork is and is not
 
@@ -30,13 +39,35 @@ The upstream project trains a GPT-2 capability model on an 8×H100 node in under
 - GPU training of any kind (no CUDA kernels)
 - distributed training (NCCL cannot be implemented in Python)
 - FlashAttention, FP8, bf16, `torch.compile`
-- the inference engine with KV caching, SFT, RL
 - MLA, MTP, and the 7.26B-total MoE run
-- GPT-2 / GPT-3 parity, the CORE evaluation, and the speedrun leaderboard
+- GPT-2 / GPT-3 parity, the speedrun leaderboard
 
-What is left runs single-threaded float32 on CPU with naive O(T²) attention. It is many orders of magnitude slower than the real thing. Its demonstrated capability is a 229K-parameter model that learns one-digit addition in 22 seconds.
+What is left runs single-threaded float32 on CPU with naive O(T²) attention, so it is many orders of magnitude slower. Its demonstrated capability is a 229K-parameter model that learns one-digit addition in ~2 minutes end-to-end.
 
 **If you want to train a usable language model, use [upstream nanochat](https://github.com/karpathy/nanochat).** This fork exists to make every step of training readable — there is no layer you cannot step into with a debugger.
+
+## The full pipeline
+
+Run each stage individually or use `bash runs/speedrun.sh` to chain them:
+
+```bash
+# 1. Pretrain a base model (next-token prediction, checkpoints every N steps)
+python -m scripts.base_train --depth 4 --num-iterations 400 --run base
+
+# 2. Evaluate: bits-per-byte + CORE-style multiple-choice accuracy + greedy samples
+python -m scripts.base_eval --run base
+
+# 3. Supervised finetuning on conversations (only assistant tokens are trained)
+python -m scripts.chat_sft --source base --run sft
+
+# 4. Talk to it
+python -m scripts.chat_cli --run sft
+python -m scripts.chat_cli --run sft -p "3+4"    # single prompt, non-interactive
+
+# Bonus: the quick-iteration scratch trainer (no checkpoints, no eval pipeline)
+python -m scripts.scratch_train --n-routed-experts 4   # MoE
+python -m scripts.scratch_train --text-file book.txt   # any UTF-8 corpus
+```
 
 ## What's in it
 
@@ -44,27 +75,23 @@ What is left runs single-threaded float32 on CPU with naive O(T²) attention. It
 |------|----------|-------|--------------|
 | `nanochat/scratch/tensor.py` | `torch.Tensor`, `torch.autograd` | 660 | Reverse-mode AD: per-op backward closures, reverse-topological backward pass, broadcasting adjoints, fused `softmax`/`cross_entropy`/`rms_norm`, and the `topk`/`index_add` scatter-gather pair the MoE router needs |
 | `nanochat/scratch/nn.py` | `torch.nn` | 257 | `Module.__setattr__` parameter/submodule registration, `named_parameters`, `state_dict`, `Linear`, `Embedding`, naive attention with GQA and sliding-window masks |
-| `nanochat/scratch/model.py` | `nanochat/gpt.py` | 425 | RMSNorm, RoPE + QK-norm, ResFormer value embeddings, embedding smear, per-layer resid/x0 scalars, mid-layer backout, ReLU² FFNs, DeepSeek-V2 MoE with load-balancing aux loss, tanh-softcapped logits |
+| `nanochat/scratch/model.py` | `nanochat/gpt.py` | 456 | RMSNorm, RoPE + QK-norm, ResFormer value embeddings, embedding smear, per-layer resid/x0 scalars, mid-layer backout, ReLU² FFNs, DeepSeek-V2 MoE with load-balancing aux loss, tanh-softcapped logits, **KV cache for O(n) decoding** |
+| `nanochat/scratch/engine.py` | `nanochat/engine.py` | 210 | KV-cache inference engine: prefill + decode split, multi-sample fanout off one prefill, stop tokens, streaming token generator, Python calculator tool loop |
+| `nanochat/scratch/eval.py` | `nanochat/loss_eval.py`, `nanochat/core_eval.py` | 205 | bits-per-byte (token-size-normalised), CORE-style MC/schema/LM task evaluation with few-shot, prompt rendering without jinja2 |
+| `nanochat/scratch/checkpoint.py` | `nanochat/checkpoint_manager.py` | 122 | Atomic `.npz` + `meta.json` saves, optimizer state keyed by parameter name, resume, `find_last_step` |
 | `nanochat/scratch/optim.py` | `torch.optim`, `nanochat/optim.py` | 226 | AdamW with decoupled decay, and Muon (Polar Express orthogonalization, no SVD) |
-| `nanochat/scratch/data.py` | `nanochat/dataloader.py` | 77 | Byte tokenizer and batch sampler |
+| `nanochat/scratch/data.py` | `nanochat/dataloader.py` | 115 | Byte tokenizer, random batches, sequential evaluation batches, the addition corpus with its known entropy floor |
 | `nanochat/bpe.py` | `rustbpe`, `tiktoken` | 402 | Byte-level BPE: training (merge counting with incremental updates) and inference, standard library only |
 
-## Usage
+## The default task: two-digit addition
 
-```bash
-python -m scripts.scratch_train                        # dense
-python -m scripts.scratch_train --n-routed-experts 4   # MoE
-python -m scripts.scratch_train --text-file book.txt   # your own text
-python -m scripts.scratch_train --help                 # all knobs
-```
-
-The default task is two-digit addition (`"7+5=12;"`). That choice is deliberate: its entropy is known exactly, so there is a real target to hit rather than just a loss curve that goes down. Every character of a line is determined by the two operands, so the only information in the stream is those operands:
+The default corpus is `"7+5=12;"` repeated 20,000 times with random operands. Its entropy is known exactly, so there is a real number to aim at rather than just a curve that goes down. Every character of a line is determined by the two operands, so the only information in the stream is those operands:
 
 \[
-H = \frac{2\ln 10}{7} = 0.6579 \text{ nats/token}
+H = \frac{2\ln 10}{7} = 0.6579 \text{ nats/token} = 0.9491 \text{ bits/byte}
 \]
 
-A model at ~0.66 has learned to carry. A model at ~2.3 has only learned character frequencies.
+A model that reaches bpb ~0.95 has learned to carry. One stuck at ~7.8 has only learned character frequencies (the baseline for a random model over 256 bytes is log₂(256) = 8.0 bits/byte).
 
 ## How the gradients are verified
 
