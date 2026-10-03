@@ -27,16 +27,26 @@ def _patch_missing_config_keys(model_config_kwargs):
         log0(f"Patching missing window_pattern in model config to 'L'")
 
 def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
+    """Add default values for new parameters that may be missing in old checkpoints.
+
+    Patched tensors are created on the checkpoint's device: the model is loaded with
+    assign=True, so a CPU default would stay on CPU next to CUDA weights.
+    """
     n_layer = model_config.n_layer
+    device = next(iter(model_data.values())).device if model_data else "cpu"
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
+        model_data["resid_lambdas"] = torch.ones(n_layer, device=device)
         log0(f"Patching missing resid_lambdas in model data to 1.0")
     # x0_lambdas defaults to 0.0 (disabled)
     if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
+        model_data["x0_lambdas"] = torch.zeros(n_layer, device=device)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    # checkpoints older than smear/backout: zeros reproduce their original forward exactly
+    for key, shape in (("smear_gate.weight", (1, 24)), ("smear_lambda", (1,)), ("backout_lambda", (1,))):
+        if key not in model_data:
+            model_data[key] = torch.zeros(shape, device=device)
+            log0(f"Patching missing {key} in model data to 0.0 (disabled)")
 
 def _atomic_save(data, path, as_json=False):
     temp_path = f"{path}.{os.getpid()}.tmp"

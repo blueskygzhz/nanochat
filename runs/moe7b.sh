@@ -5,7 +5,7 @@
 # Reference hardware: 8 x 80GB CUDA GPUs. Memory fit and throughput require a smoke run.
 # Weights/gradients remain replicated; optimizer state is sharded. No expert parallelism.
 # The ~50B-token budget is an initial experiment, not a convergence guarantee.
-# Modes: check (default, meta only), prepare (downloads data), smoke, train, eval, sft.
+# Modes: check (default, meta only), prepare (downloads data), smoke, train, eval, sft, rl.
 # Set NANOCHAT_BASE_DIR to a persistent disk with space for data and multiple ~60GB checkpoints.
 
 set -euo pipefail
@@ -79,5 +79,8 @@ case "$MODE" in
     sft)
         "${launch[@]}" -m scripts.chat_sft --model-tag="$MODEL_TAG" --run="$WANDB_RUN" "$@"
         ;;
-    *) echo "Usage: bash runs/moe7b.sh {check|prepare|smoke|train|eval|sft} [extra arguments]" >&2; exit 2 ;;
+    rl)
+        "${launch[@]}" -m scripts.chat_rl --model-tag="$MODEL_TAG" --run="$WANDB_RUN" "$@"
+        ;;
+    *) echo "Usage: bash runs/moe7b.sh {check|prepare|smoke|train|eval|sft|rl} [extra arguments]" >&2; exit 2 ;;
 esac

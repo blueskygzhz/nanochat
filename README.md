@@ -57,6 +57,9 @@ uv sync --extra gpu --group dev
 | 正式预训练 | `bash runs/moe7b.sh train` | 不自动执行 SFT；默认 BF16、每卡 batch=1 |
 | 恢复预训练 | `RESUME_STEP=2000 bash runs/moe7b.sh train` | 架构、world size、Muon 桶大小和总 batch 必须与原训练一致 |
 | 评测 / SFT | `bash runs/moe7b.sh eval` / `bash runs/moe7b.sh sft` | SFT 继承分块 loss、激活重计算和优化器桶配置 |
+| RL（GSM8K） | `bash runs/moe7b.sh rl` | 从 SFT checkpoint 继承上述显存设置及 MoE/MLA/MTP 架构；保留 MoE 负载均衡 loss |
+
+SFT 的 `--num-iterations=N` 精确执行 N 次优化器更新（与梯度累积步数无关），学习率按 `step/N` 调度，数据不足时自动进入下一轮；`-1` 表示跑满一个 epoch。超过一行容量（`max_seq_len+1` token）的对话会被截断到一行并计数告警，不再导致打包卡死；需要完整保留时请增大 `--max-seq-len`。
 
 显存余量足够后，可将 `DEVICE_BATCH` 逐步调至 2 或 4；脚本自动用梯度累积维持 `TOTAL_BATCH`。`LOSS_CHUNK_SIZE=512` 限制单个 logits 块，`MUON_BUCKET_MB=128` 将大专家组拆桶并逐桶通信/更新。这两个设置以显存为优先，不保证更高吞吐。最小桶还受完整矩阵和 rank 对齐约束，128 MiB 不是整个优化器的硬显存上限。
 
@@ -103,7 +106,7 @@ uv sync --extra gpu --group dev
 | 使用 SFT checkpoint 投机聊天 | `python -m scripts.chat_cli --model-tag=moe7b-mtp --temperature=0 --speculative` |
 | 对比普通与投机解码 | `python -m scripts.infer_bench -i sft -g moe7b-mtp --speculative --prompt-tokens=512 --decode-tokens=128` |
 
-启用时默认标签为 `moe7b-mtp` 或 `moe7b-mla-mtp`；对 MLA 的后续操作同样设置 `ATTENTION_TYPE=mla`。SFT 自动加载并训练草稿头，可用 `--mtp-loss-weight=0` 禁用辅助目标（这不是冻结共享主干）。旧 checkpoint 没有 MTP 参数时仍可普通推理，但不能直接加 `--speculative`；也不能将旧 optimizer 原样恢复为新增草稿头的模型。当前不提供旧模型的自动头迁移，需要从 MTP 配置开始训练。SFT 保存完整 MTP 配置和权重；RL 尚不继续训练 MTP 辅助目标。
+启用时默认标签为 `moe7b-mtp` 或 `moe7b-mla-mtp`；对 MLA 的后续操作同样设置 `ATTENTION_TYPE=mla`。SFT 自动加载并训练草稿头，可用 `--mtp-loss-weight=0` 禁用辅助目标（这不是冻结共享主干）。旧 checkpoint 没有 MTP 参数时仍可普通推理，但不能直接加 `--speculative`；也不能将旧 optimizer 原样恢复为新增草稿头的模型。当前不提供旧模型的自动头迁移，需要从 MTP 配置开始训练。SFT 保存完整 MTP 配置和权重；RL 的策略梯度没有 MTP 项，因此草稿头在 RL 中冻结（不进优化器）并原样保存。投机解码仍逐 token 验证、结果不变，但主干更新后接受率可能下降。
 
 解码过程：主头从当前前缀确定 token `a`，MTP 根据该前缀隐藏态和 `a` 提议 `b`；主干一次处理 `[a,b]`，用 `a` 位置的主头 argmax 检验 `b`。接受则保留两个位置的缓存；拒绝则只保留 `a`，恢复 GQA/MLA 长度与 pre-smear embedding，下一步使用主头纠正 token。草稿从不绕过主模型验证。工具表达式、强制工具结果及工具边界走普通逐 token 路径；只对已提交的 token 执行工具状态变更。
 
@@ -201,7 +204,7 @@ NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # for
 
 How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
 
-Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too but RL currently does not. Inference in fp16 works fine everywhere.
+Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too; RL does not and exits with an explicit error under fp16. Inference in fp16 works fine everywhere.
 
 ## Guides
 

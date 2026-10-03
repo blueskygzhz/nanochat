@@ -266,6 +266,30 @@ def test_legacy_checkpoint_without_mla_fields_loads(monkeypatch, tmp_path):
         torch.testing.assert_close(loaded(ids), original(ids))
 
 
+def test_legacy_checkpoint_without_scalar_features_loads(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from nanochat import checkpoint_manager as manager
+    cfg = config(attention_type='gqa')
+    original = build(cfg).eval()
+    with torch.no_grad(): # a model from before resid/x0/smear/backout existed
+        original.resid_lambdas.fill_(1.0)
+        original.x0_lambdas.zero_()
+        original.smear_lambda.zero_()
+        original.backout_lambda.zero_()
+    legacy_keys = ('resid_lambdas', 'x0_lambdas', 'smear_gate.weight', 'smear_lambda', 'backout_lambda')
+    state = {k: v for k, v in original.state_dict().items() if k not in legacy_keys}
+    manager.save_checkpoint(tmp_path, 1, state, None, {'model_config': asdict(cfg)})
+    monkeypatch.setattr(manager, 'get_tokenizer', lambda: SimpleNamespace(get_vocab_size=lambda: cfg.vocab_size))
+    loaded, _, _ = manager.build_model(tmp_path, 1, torch.device('cpu'), 'eval')
+    ids = torch.randint(0, cfg.vocab_size, (1, 7))
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(ids), original(ids))
+    # assign=True keeps patched tensors where they are created, so they must follow the checkpoint device
+    patched = {'lm_head.weight': torch.empty(2, device='meta')}
+    manager._patch_missing_keys(patched, cfg)
+    assert all(v.device.type == 'meta' for v in patched.values())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 def test_cuda_bfloat16_cached_decode(monkeypatch):
     monkeypatch.setattr('nanochat.gpt.COMPUTE_DTYPE', torch.bfloat16)

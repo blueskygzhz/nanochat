@@ -44,6 +44,26 @@ def test_special_tokens(tokenizer):
     assert len(ids) > 1, "special token strings in plain text should not collapse to one token"
 
 
+def test_encode_special_rejects_ordinary_tokens(tokenizer):
+    # "a" is an ordinary byte token; encode_single_token would return it, encode_special must not
+    assert tokenizer.enc.encode_single_token("a") is not None
+    with pytest.raises(KeyError, match="Unknown special token"):
+        tokenizer.encode_special("a")
+    with pytest.raises(KeyError, match="Unknown special token"):
+        tokenizer.encode_special("<|not_registered|>")
+
+
+def test_special_token_colliding_with_ordinary_token_is_rejected():
+    import tiktoken
+    ranks = {bytes([i]): i for i in range(256)}
+    ranks[b"<|bos|>"] = 256 # an ordinary token with the same bytes as a special token
+    enc = tiktoken.Encoding(name="collide", pat_str=r"\S+|\s+", mergeable_ranks=ranks,
+                            special_tokens={"<|bos|>": 257})
+    assert enc.encode_single_token("<|bos|>") == 256 # the footgun encode_special used to hit
+    with pytest.raises(ValueError, match="ordinary BPE tokens"):
+        RustBPETokenizer(enc, "<|bos|>")
+
+
 def test_encode_prepend_append(tokenizer):
     bos = tokenizer.get_bos_token_id()
     ids = tokenizer.encode("hello", prepend="<|bos|>", append="<|user_end|>")
@@ -121,6 +141,20 @@ def test_render_conversation_truncation(tokenizer):
     ]}
     ids, mask = tokenizer.render_conversation(conversation, max_tokens=32)
     assert len(ids) == 32 and len(mask) == 32
+    full_ids, _ = tokenizer.render_conversation(conversation, max_tokens=None)
+    assert len(full_ids) > 32 and full_ids[:32] == ids
+    with pytest.raises(ValueError, match="max_tokens"):
+        tokenizer.render_conversation(conversation, max_tokens=0)
+
+
+def test_render_for_completion_does_not_crop_long_prompts(tokenizer):
+    conversation = {"messages": [
+        {"role": "user", "content": "hello " * 3000},
+        {"role": "assistant", "content": "x"},
+    ]}
+    ids = tokenizer.render_for_completion(conversation)
+    assert len(ids) > 2048
+    assert ids[-2] == tokenizer.encode_special("<|user_end|>")
 
 
 def test_render_for_completion(tokenizer):

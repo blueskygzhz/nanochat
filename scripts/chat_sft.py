@@ -202,16 +202,22 @@ val_dataset = TaskMixture([
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
-last_step = False # we will toggle this to True when we reach the end of the training dataset
+if args.num_iterations == 0 or args.num_iterations < -1:
+    raise ValueError("--num-iterations must be positive or -1 (one full epoch)")
+last_step = False # toggled by the data generator at the end of the epoch (num_iterations=-1 only)
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
 current_epoch = 1 # track epoch for logging
+# Conversations longer than one packed row are cropped to the row; counted per split for logging.
+truncated_conversations = {"train": 0, "val": 0}
 def sft_data_generator_bos_bestfit(split, buffer_size=100):
     """
     BOS-aligned dataloader for SFT with bestfit-pad packing.
 
     Each row in the batch starts with BOS (beginning of a conversation).
     Conversations are packed using best-fit algorithm. When no conversation fits,
-    the row is padded (instead of cropping) to ensure no tokens are ever discarded.
+    the row is padded (instead of cropping) to ensure no packed tokens are discarded.
+    A single conversation longer than a whole row (max_seq_len + 1 tokens) is cropped
+    to the row when rendered, so it always fits an empty row and can never stall packing.
     Padding positions have targets masked with -1 (ignore_index for cross-entropy).
     """
     global last_step, approx_progress, current_epoch
@@ -227,13 +233,18 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
-    it = 0  # iteration counter
 
     def refill_buffer():
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=row_capacity + 1)
+            if len(ids) > row_capacity:
+                ids, mask = ids[:row_capacity], mask[:row_capacity]
+                truncated_conversations[split] += 1
+                if truncated_conversations[split] in (1, 10, 100, 1000) or truncated_conversations[split] % 10000 == 0:
+                    print0(f"WARNING: {truncated_conversations[split]} {split} conversation(s) exceeded "
+                           f"{row_capacity} tokens and were cropped (raise --max-seq-len to keep them whole)")
             conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
@@ -275,6 +286,8 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     # No conversation fits - pad the remainder instead of cropping
                     # This ensures we never discard any tokens
                     content_len = len(row)
+                    if content_len == 0:
+                        raise RuntimeError("SFT packing stalled: no buffered conversation fits an empty row")
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
                     padded = True
@@ -288,21 +301,15 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
 
-        # Stopping condition to respect num_iterations, if given
-        it += 1
-        if 0 < args.num_iterations <= it and split == "train":
-            last_step = True
-
-        # Update progress tracking (based on consumed, not cursor, to account for buffering)
+        # Epoch-driven progress/stopping (based on consumed, not cursor, to account for buffering).
+        # With an explicit --num-iterations the training loop counts optimizer steps instead,
+        # and the generator keeps cycling epochs as needed.
         if split == "train":
             current_epoch = epoch
-            if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
-            else:
+            if args.num_iterations < 0:
                 approx_progress = consumed / dataset_size
-            # Trigger last_step when we've consumed enough (instead of when cursor wraps)
-            if consumed >= dataset_size:
-                last_step = True
+                if consumed >= dataset_size:
+                    last_step = True
 
         # Build tensors
         use_cuda = device_type == "cuda"
@@ -455,7 +462,10 @@ while True:
         else:
             loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        progress = max(progress, approx_progress) # only increase progress monotonically
+        if args.num_iterations < 0:
+            progress = max(progress, approx_progress) # only increase progress monotonically
+    if args.num_iterations > 0:
+        progress = step / args.num_iterations # optimizer-step based, same convention as base_train
     # step the optimizer
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
@@ -480,11 +490,13 @@ while True:
 
     # State
     step += 1
+    if args.num_iterations > 0 and step >= args.num_iterations:
+        last_step = True # stop after exactly num_iterations optimizer steps
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * progress
+    pct_done = 100 * (step / args.num_iterations if args.num_iterations > 0 else progress)
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
@@ -518,6 +530,7 @@ while True:
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
+print0(f"Cropped over-long conversations (rank 0): train={truncated_conversations['train']}, val={truncated_conversations['val']}")
 
 # cleanup
 wandb_run.finish() # wandb run finish

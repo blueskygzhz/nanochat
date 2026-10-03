@@ -22,7 +22,7 @@ import itertools
 import wandb
 import torch
 import torch.distributed as dist
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type, COMPUTE_DTYPE
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -43,6 +43,10 @@ parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs 
 parser.add_argument("--device-batch-size", type=int, default=8, help="max batch size per forward pass")
 parser.add_argument("--examples-per-step", type=int, default=16, help="total examples per optimization step across all ranks")
 parser.add_argument("--num-samples", type=int, default=16, help="number of samples per example/question")
+# Memory settings (default: inherit from the SFT checkpoint, which inherits them from pretraining)
+parser.add_argument("--activation-checkpointing", type=int, default=-1, help="1=on, 0=off, -1=inherit from SFT")
+parser.add_argument("--loss-chunk-size", type=int, default=None, help="LM-head loss chunk size (default: inherit)")
+parser.add_argument("--muon-bucket-mb", type=int, default=None, help="Muon bucket target in MiB (default: inherit)")
 # Generation
 parser.add_argument("--max-new-tokens", type=int, default=256, help="max tokens to generate per sample")
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
@@ -71,7 +75,30 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
 
 # Init model and tokenizer
+if COMPUTE_DTYPE == torch.float16:
+    raise ValueError("chat_rl does not support float16 training (no GradScaler); use bf16 or fp32")
+if args.device_batch_size <= 0 or args.num_samples <= 0 or args.num_samples % args.device_batch_size != 0:
+    raise ValueError("--num-samples must be a positive multiple of --device-batch-size")
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+
+# Inherit the memory settings of the large-model path (None/-1 = inherit, explicit value = override)
+sft_user_config = meta.get("user_config", {})
+for name in ("loss_chunk_size", "muon_bucket_mb"):
+    if getattr(args, name) is None:
+        setattr(args, name, int(sft_user_config.get(name) or 0))
+    if getattr(args, name) < 0:
+        raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
+if args.activation_checkpointing < 0:
+    args.activation_checkpointing = int(bool(sft_user_config.get("activation_checkpointing", False)))
+model.activation_checkpointing = bool(args.activation_checkpointing)
+model.loss_chunk_size = args.loss_chunk_size
+user_config.update(vars(args))
+print0(f"Activation checkpointing: {model.activation_checkpointing} | loss chunk: {args.loss_chunk_size} | Muon bucket MiB: {args.muon_bucket_mb}")
+print0(f"Architecture: attention={model.config.attention_type}, routed experts={model.config.n_routed_experts}, MTP={model.config.mtp_enabled}")
+if model.config.mtp_enabled:
+    # The policy-gradient loss has no MTP term; the draft head is kept frozen and saved unchanged.
+    # Speculative decoding stays exact (every draft is verified) but acceptance may drop.
+    print0("MTP draft head is frozen during RL")
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -199,6 +226,8 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
+    muon_bucket_mb=args.muon_bucket_mb,
+    train_mtp=False,
 )
 
 # Set the initial learning rate as a fraction of the base learning rate
@@ -225,7 +254,8 @@ for step in range(num_steps):
     if step % args.eval_every == 0:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
-        records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
+        records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples,
+                                       max_completion_tokens=args.max_new_tokens, temperature=1.0)
         records = list(records_iter) # collect all records
         for k in range(1, args.device_batch_size + 1):
             passk[k - 1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)
@@ -270,6 +300,11 @@ for step in range(num_steps):
             # Note, there is no need to add PPO ratio+clip because we are on policy
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
+            # The per-token ('none') loss skips the MoE load-balancing term; add it back so the
+            # routers do not collapse during RL. Same per-forward weight as pre-training/SFT.
+            aux = model.collect_aux_loss()
+            if aux is not None:
+                loss = loss + aux.to(loss.dtype) / (num_passes * examples_per_rank)
             loss.backward()
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
         # For logging
@@ -310,14 +345,15 @@ for step in range(num_steps):
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
         save_checkpoint(
             checkpoint_dir,
             step,
             model.state_dict(),
             None, # note: we don't bother to save the optimizer state
             {
-                "model_config": model_config_kwargs,
+                "step": step,
+                "model_config": dict(vars(model.config)), # full MoE/MLA/MTP architecture
+                "user_config": user_config,
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

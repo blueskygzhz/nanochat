@@ -4,7 +4,6 @@ BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken
 
 import os
 import copy
-from functools import lru_cache
 
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
@@ -36,6 +35,13 @@ class RustBPETokenizer:
 
     def __init__(self, enc, bos_token):
         self.enc = enc
+        # Only registered special tokens may be looked up by name: tiktoken's
+        # encode_single_token prefers an ordinary token with identical bytes.
+        self._special_token_ids = dict(enc._special_tokens)
+        ordinary = getattr(enc, "_mergeable_ranks", {})
+        collisions = sorted(name for name in self._special_token_ids if name.encode("utf-8") in ordinary)
+        if collisions:
+            raise ValueError(f"Special tokens also exist as ordinary BPE tokens: {collisions}")
         self.bos_token_id = self.encode_special(bos_token)
 
     @classmethod
@@ -50,6 +56,9 @@ class RustBPETokenizer:
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
         mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
+        collisions = [name for name in SPECIAL_TOKENS if name.encode("utf-8") in mergeable_ranks]
+        if collisions:
+            raise ValueError(f"Trained vocabulary contains special token byte strings: {collisions}")
         tokens_offset = len(mergeable_ranks)
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
         enc = tiktoken.Encoding(
@@ -86,9 +95,11 @@ class RustBPETokenizer:
     def id_to_token(self, id):
         return self.enc.decode([id])
 
-    @lru_cache(maxsize=32)
     def encode_special(self, text):
-        return self.enc.encode_single_token(text)
+        try:
+            return self._special_token_ids[text]
+        except KeyError:
+            raise KeyError(f"Unknown special token: {text!r}") from None
 
     def get_bos_token_id(self):
         return self.bos_token_id
@@ -218,9 +229,12 @@ class RustBPETokenizer:
                     raise ValueError(f"Unknown content type: {type(content)}")
                 add_tokens(assistant_end, 1)
 
-        # truncate to max_tokens tokens MAX (helps prevent OOMs)
-        ids = ids[:max_tokens]
-        mask = mask[:max_tokens]
+        # truncate to max_tokens tokens MAX (helps prevent OOMs); None keeps everything
+        if max_tokens is not None:
+            if max_tokens <= 0:
+                raise ValueError("max_tokens must be positive or None")
+            ids = ids[:max_tokens]
+            mask = mask[:max_tokens]
         return ids, mask
 
     def visualize_tokenization(self, ids, mask, with_token_id=False):
@@ -250,8 +264,8 @@ class RustBPETokenizer:
         assert messages[-1]["role"] == "assistant", "Last message must be from the Assistant"
         messages.pop() # remove the last message (of the Assistant) inplace
 
-        # Now tokenize the conversation
-        ids, mask = self.render_conversation(conversation)
+        # Never silently crop a prompt: the caller's context limit applies to the full prompt.
+        ids, mask = self.render_conversation(conversation, max_tokens=None)
 
         # Finally, to prime the Assistant for a completion, append the Assistant start token
         assistant_start = self.encode_special("<|assistant_start|>")

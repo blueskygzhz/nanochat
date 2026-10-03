@@ -100,7 +100,7 @@ def test_sft_inherits_and_saves_trained_mtp(offline_training, monkeypatch):
     result = run('--mtp')
     before = result['orig_model'].mtp.fuse.weight.detach().clone()
     fake_tokenizer = tokenizer.get_tokenizer()
-    fake_tokenizer.render_conversation = lambda conversation: ([127, 1, 2, 3, 4], [0, 0, 0, 1, 1])
+    fake_tokenizer.render_conversation = lambda conversation, max_tokens=2048: ([127, 1, 2, 3, 4], [0, 0, 0, 1, 1])
 
     class TinyTask:
         def __init__(self, *args, **kwargs):
@@ -118,6 +118,9 @@ def test_sft_inherits_and_saves_trained_mtp(offline_training, monkeypatch):
                                      '--num-iterations=2', '--chatcore-every=-1', '--eval-every=-1',
                                      '--warmdown-ratio=0', '--mtp-loss-weight=0.3'])
     trained = runpy.run_module('scripts.chat_sft', run_name='__main__')
+    # grad_accum_steps=2 here: num_iterations counts optimizer steps, not generator yields
+    assert trained['grad_accum_steps'] == 2
+    assert trained['step'] == 2
     assert trained['orig_model'].config.mtp_enabled
     assert trained['orig_model'].config.mtp_loss_weight == 0.3
     assert trained['orig_model'].loss_chunk_size == 8
@@ -134,6 +137,121 @@ def test_sft_inherits_and_saves_trained_mtp(offline_training, monkeypatch):
         hidden = loaded.forward_hidden(idx)
         torch.testing.assert_close(loaded.mtp_logits(hidden[:, -1:], idx[:, -1:]),
                                    trained['orig_model'].mtp_logits(hidden[:, -1:], idx[:, -1:]))
+
+
+class _TinyChatTask:
+    def __init__(self, *args, length=6, **kwargs):
+        self.length = length
+    def __len__(self):
+        return self.length
+    def __getitem__(self, index):
+        return {'messages': [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': 'a'}]}
+
+
+def _patch_sft_tasks(monkeypatch):
+    from nanochat import loss_eval
+    from tasks import smoltalk, mmlu, gsm8k
+    monkeypatch.setattr(smoltalk, 'SmolTalk', _TinyChatTask)
+    monkeypatch.setattr(mmlu, 'MMLU', _TinyChatTask)
+    monkeypatch.setattr(gsm8k, 'GSM8K', _TinyChatTask)
+    monkeypatch.setattr(loss_eval, 'evaluate_bpb', lambda *args: 0.5)
+
+
+def test_sft_crops_conversations_longer_than_a_row(offline_training, monkeypatch):
+    run, _ = offline_training
+    run()
+    seen_limits = []
+    long_ids, long_mask = [127] + list(range(1, 40)), [0] * 10 + [1] * 30
+
+    def render(conversation, max_tokens=2048):
+        seen_limits.append(max_tokens)
+        return long_ids[:max_tokens], long_mask[:max_tokens]
+
+    tokenizer.get_tokenizer().render_conversation = render
+    _patch_sft_tasks(monkeypatch)
+    # Full-epoch mode: before the fix a 40-token conversation never fit a 17-token row and
+    # the packer padded forever. Now it is cropped to the row and the epoch terminates.
+    monkeypatch.setattr(sys, 'argv', ['chat_sft', '--device-type=cpu', '--no-compile', '--model-tag=unit',
+                                     '--num-iterations=-1', '--chatcore-every=-1', '--eval-every=-1',
+                                     '--mmlu-epochs=0', '--gsm8k-epochs=0', '--load-optimizer=0'])
+    trained = runpy.run_module('scripts.chat_sft', run_name='__main__')
+    row_capacity = trained['args'].max_seq_len + 1
+    assert set(seen_limits) == {row_capacity + 1}
+    assert trained['truncated_conversations']['train'] >= 6
+    assert 1 <= trained['step'] <= 4
+
+
+def test_sft_rejects_zero_iterations(offline_training, monkeypatch):
+    run, _ = offline_training
+    run()
+    tokenizer.get_tokenizer().render_conversation = lambda conversation, max_tokens=2048: ([127, 1, 2], [0, 1, 1])
+    _patch_sft_tasks(monkeypatch)
+    monkeypatch.setattr(sys, 'argv', ['chat_sft', '--device-type=cpu', '--no-compile', '--model-tag=unit',
+                                     '--num-iterations=0', '--chatcore-every=-1', '--eval-every=-1'])
+    with pytest.raises(ValueError, match='num-iterations'):
+        runpy.run_module('scripts.chat_sft', run_name='__main__')
+
+
+@pytest.mark.parametrize('attention', ['gqa', 'mla'])
+def test_rl_inherits_memory_settings_and_architecture(offline_training, monkeypatch, attention):
+    import shutil
+    from tasks import gsm8k
+    run, base_directory = offline_training
+    arch = [f'--attention-type={attention}', '--q-lora-rank=16', '--kv-lora-rank=16',
+            '--qk-nope-head-dim=12', '--qk-rope-head-dim=8', '--v-head-dim=10', '--mtp']
+    base = run(*arch)
+    before = {k: v.detach().clone() for k, v in base['orig_model'].state_dict().items()}
+    sft_directory = base_directory.parent.parent / 'chatsft_checkpoints' / 'unit'
+    shutil.copytree(base_directory, sft_directory) # stands in for an SFT checkpoint
+
+    fake = tokenizer.get_tokenizer()
+    specials = {'<|python_start|>': 120, '<|python_end|>': 121, '<|output_start|>': 122,
+                '<|output_end|>': 123, '<|assistant_end|>': 124, '<|assistant_start|>': 125}
+    fake.encode_special = specials.__getitem__
+    fake.render_for_completion = lambda conversation: [127, 1, 2, 3, 125]
+    fake.decode = lambda ids: ' '.join(map(str, ids))
+    fake.encode = lambda text: [ord(c) % 100 for c in text]
+
+    class TinyGSM8K(_TinyChatTask):
+        def __init__(self, *args, **kwargs):
+            super().__init__(length=2)
+        def reward(self, conversation, text):
+            return float(len(text) % 2)
+        def evaluate(self, conversation, text):
+            return len(text) % 2 == 0
+
+    monkeypatch.setattr(gsm8k, 'GSM8K', TinyGSM8K)
+    monkeypatch.setattr(sys, 'argv', ['chat_rl', '--device-type=cpu', '--model-tag=unit', '--device-batch-size=2',
+                                     '--num-samples=2', '--examples-per-step=1', '--max-new-tokens=4',
+                                     '--eval-every=100', '--eval-examples=1', '--save-every=100'])
+    result = runpy.run_module('scripts.chat_rl', run_name='__main__')
+    model = result['model']
+    assert model.activation_checkpointing and model.loss_chunk_size == 8
+    assert result['optimizer'].memory_efficient
+    assert model.config.attention_type == attention and model.config.mtp_enabled
+    after = model.state_dict()
+    for name, value in before.items():
+        if name.startswith('mtp.'):
+            torch.testing.assert_close(after[name], value) # draft head is frozen during RL
+    assert all(not p.requires_grad for p in model.mtp.parameters())
+    assert any(not torch.equal(after[n], v) for n, v in before.items() if n.startswith('transformer.h.'))
+
+    rl_directory = base_directory.parent.parent / 'chatrl_checkpoints' / 'unit'
+    step = checkpoints.find_last_step(rl_directory)
+    assert step == result['num_steps'] - 1
+    loaded, _, meta = checkpoints.build_model(rl_directory, step, torch.device('cpu'), 'eval')
+    assert meta['model_config']['attention_type'] == attention
+    assert meta['model_config']['mtp_enabled'] and meta['user_config']['loss_chunk_size'] == 8
+    model.eval()
+    x = torch.tensor([[1, 2, 3, 4]])
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(x), model(x))
+
+
+def test_rl_rejects_sample_count_not_divisible_by_batch(offline_training, monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['chat_rl', '--device-type=cpu', '--device-batch-size=3', '--num-samples=4'])
+    with pytest.raises(ValueError, match='multiple of --device-batch-size'):
+        runpy.run_module('scripts.chat_rl', run_name='__main__')
 
 
 def test_missing_training_shard_fails_instead_of_spinning(monkeypatch):
