@@ -705,6 +705,148 @@ def test_init_seed_controls_the_weights():
 
 
 # ----------------------------------------------------------------------------
+# tokenizer provenance and the chat format
+
+@pytest.fixture(scope="module")
+def bpe_dir(tmp_path_factory):
+    """A tiny BPE tokenizer, trained in ~0.1s, saved the way tok_train saves it."""
+    from nanochat.tokenizer import RustBPETokenizer
+    text = "the cat sat on the mat. " * 50 + make_addition_corpus(200, seed=0)
+    path = tmp_path_factory.mktemp("tok")
+    RustBPETokenizer.train_from_iterator(iter([text]), 300).save(str(path))
+    return str(path)
+
+
+def test_tokenizer_spec_round_trips_and_checks_vocab(bpe_dir, tmp_path):
+    from nanochat.tokenizer import load_tokenizer, snapshot_tokenizer, tokenizer_spec
+    assert isinstance(load_tokenizer(None), ByteTokenizer), "legacy checkpoints => bytes"
+    assert snapshot_tokenizer(tokenizer_spec("byte"), str(tmp_path)) == {"kind": "byte"}
+
+    from nanochat.tokenizer import RustBPETokenizer
+    vocab = RustBPETokenizer.from_directory(bpe_dir).get_vocab_size()
+    spec = snapshot_tokenizer(tokenizer_spec("bpe", bpe_dir), str(tmp_path / "run"))
+    assert spec["dir"] == str(tmp_path / "run" / "tokenizer") and spec["vocab_size"] == vocab
+    tok = load_tokenizer(json.loads(json.dumps(spec)))   # must survive meta.json
+    assert tok.get_vocab_size() == vocab
+    with pytest.raises(ValueError, match="checkpoint expects"):
+        load_tokenizer({**spec, "vocab_size": 999})
+    with pytest.raises(FileNotFoundError, match="tok_train"):
+        load_tokenizer({"kind": "bpe", "dir": str(tmp_path / "nowhere")})
+
+
+def test_snapshot_isolates_the_run_from_retraining(bpe_dir, tmp_path):
+    """Re-running tok_train must not change the vocabulary under a trained model."""
+    import shutil
+    from nanochat.tokenizer import RustBPETokenizer, load_tokenizer, snapshot_tokenizer, tokenizer_spec
+    src = tmp_path / "shared"
+    shutil.copytree(bpe_dir, src)
+    vocab = RustBPETokenizer.from_directory(str(src)).get_vocab_size()
+    spec = snapshot_tokenizer(tokenizer_spec("bpe", str(src)), str(tmp_path / "run"))
+    RustBPETokenizer.train_from_iterator(iter(["zzz yyy " * 100]), 280).save(str(src))
+    assert RustBPETokenizer.from_directory(str(src)).get_vocab_size() != vocab
+    assert load_tokenizer(spec).get_vocab_size() == vocab
+
+
+def test_encode_corpus_puts_bos_where_prompts_will_have_it(bpe_dir):
+    from nanochat.scratch import encode_corpus
+    from nanochat.tokenizer import load_tokenizer
+    spec = corpus_spec(corpus_lines=50, seed=0, holdout_frac=0.2)
+    text, _ = build_corpus(spec)
+
+    # bytes: BOS is ';', already in the text at every record boundary
+    assert encode_corpus(text, ByteTokenizer(), spec) == ByteTokenizer().encode(text)
+
+    # dedicated BOS: one per record, and the record content is unchanged
+    tok = load_tokenizer({"kind": "bpe", "dir": bpe_dir})
+    ids = encode_corpus(text, tok, spec)
+    bos = tok.get_bos_token_id()
+    assert ids.count(bos) == 50 and ids[0] == bos
+    assert tok.decode([t for t in ids if t != bos]) == text
+    # and a free-text corpus is one document
+    assert encode_corpus("hello", tok, {"kind": "text"})[0] == bos
+
+
+@pytest.mark.parametrize("kind", ["byte", "bpe"])
+def test_chat_format_masks_only_assistant_replies(kind, bpe_dir):
+    from nanochat.chat_format import render_conversation, reply_stop_tokens
+    from nanochat.tokenizer import load_tokenizer
+    tok = load_tokenizer({"kind": kind, "dir": bpe_dir} if kind == "bpe" else None)
+    messages = [{"role": "user", "content": "2+3"}, {"role": "assistant", "content": "5"},
+                {"role": "user", "content": "4+4"}, {"role": "assistant", "content": "8"}]
+    ids, mask = render_conversation(tok, messages)
+    assert len(ids) == len(mask) and ids[0] == tok.get_bos_token_id()
+    stop = set(reply_stop_tokens(tok))
+    trained = [t for t, m in zip(ids, mask) if m]
+    assert tok.decode([t for t in trained if t not in stop]) == "58", \
+        "exactly the two replies are trained on, nothing from the user turns"
+    # each reply ends with a trained stop token, so the model learns when to stop
+    assert sum(t in stop for t in trained) == 2
+
+
+@pytest.mark.parametrize("kind", ["byte", "bpe"])
+def test_render_prompt_is_the_training_layout_up_to_the_reply(kind, bpe_dir):
+    """Inference must present exactly the prefix the model was trained on."""
+    from nanochat.chat_format import render_conversation, render_prompt
+    from nanochat.tokenizer import load_tokenizer
+    tok = load_tokenizer({"kind": kind, "dir": bpe_dir} if kind == "bpe" else None)
+    user = [{"role": "user", "content": "2+3"}]
+    full, mask = render_conversation(tok, user + [{"role": "assistant", "content": "5"}])
+    prompt = render_prompt(tok, user)
+    assert full[:len(prompt)] == prompt
+    assert mask[len(prompt)] == 1 and not any(mask[:len(prompt)])
+    with pytest.raises(ValueError, match="end with a user"):
+        render_prompt(tok, user + [{"role": "assistant", "content": "5"}])
+
+
+def test_fit_history_drops_whole_exchanges_oldest_first():
+    from nanochat.chat_format import fit_history, render_prompt
+    tok = ByteTokenizer()
+    history = []
+    for a in range(5):
+        history += [{"role": "user", "content": f"{a}+1"},
+                    {"role": "assistant", "content": str(a + 1)}]
+    history.append({"role": "user", "content": "9+9"})
+
+    full = len(render_prompt(tok, history))
+    kept, ids = fit_history(tok, history, budget=full)
+    assert kept == history, "nothing dropped when it fits"
+    kept, ids = fit_history(tok, history, budget=full - 1)
+    assert kept == history[2:] and len(ids) <= full - 1
+    assert kept[0]["role"] == "user" and kept[-1] == history[-1]
+    with pytest.raises(ValueError, match="alone needs"):
+        fit_history(tok, history, budget=3)
+
+
+def test_chat_cli_streams_a_reply_and_reports_dropped_history():
+    import io
+    from types import SimpleNamespace
+    from scripts.chat_cli import respond
+    tok = ByteTokenizer()
+    # full prompt = ";" + "U:1+1\n" + "A:2\n" + "U:2+2\n" + "A:" = 19 tokens, which does
+    # not fit in 20 - 4 (room reserved for the reply); dropping one exchange leaves 9
+    model = ScriptedModel([ord("4"), ord("\n")], sequence_len=20)
+    args = SimpleNamespace(max_tokens=4, temperature=0.0, top_k=None, seed=0)
+    out = io.StringIO()
+    history = [{"role": "user", "content": "1+1"}, {"role": "assistant", "content": "2"},
+               {"role": "user", "content": "2+2"}]
+    reply, dropped = respond(Engine(model, tok), tok, history, args, out=out)
+    assert reply == "4" and out.getvalue() == "4"
+    assert dropped == 2, "the oldest exchange (user + assistant) must be dropped"
+
+
+def test_no_module_imports_requests():
+    """`requests` is not a dependency (only a transitive one of an optional extra),
+    so importing it would break a default install."""
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    pattern = re.compile(r"^\s*(?:import\s+requests|from\s+requests\b)", re.MULTILINE)
+    offenders = [str(p.relative_to(root)) for d in ("nanochat", "scripts", "tasks")
+                 for p in (root / d).rglob("*.py") if pattern.search(p.read_text(encoding="utf-8"))]
+    assert not offenders, offenders
+
+
+# ----------------------------------------------------------------------------
 # the pipeline end to end
 
 @pytest.mark.slow
