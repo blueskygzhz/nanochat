@@ -11,6 +11,18 @@ dependencies = [
     "pyarrow>=21.0.0",
 ]
 
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+# Only the library is packaged. `scripts/` and `tasks/` are entry points and data
+# loaders that run from a checkout (`python -m scripts.base_train`); shipping them as
+# top-level `scripts` / `tasks` packages would squat on generic names in site-packages.
+# The editable install that `uv sync` performs puts the checkout on sys.path, so in
+# development all three are importable from any working directory.
+[tool.hatch.build.targets.wheel]
+packages = ["nanochat"]
+
 [dependency-groups]
 dev = [
     "ipykernel>=7.1.0",

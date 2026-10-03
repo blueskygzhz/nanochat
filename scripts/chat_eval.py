@@ -5,8 +5,10 @@ The from-scratch counterpart of nanochat's `scripts/chat_eval.py`. Where `base_e
 scores a base model by likelihood (no generation needed), a chat model is judged on
 what it *says*: each question is rendered in the chat format, the reply is decoded
 greedily through the KV-cache engine until the end-of-turn token, and compared with
-the answer. Upstream does this for GSM8K / HumanEval / MMLU; at this scale the task
-is the arithmetic the model was finetuned on.
+the answer. The default task is the arithmetic the model was finetuned on; the
+standard benchmarks (ARC, MMLU, GSM8K, HumanEval, downloaded from the HuggingFace hub
+on first use) run with `--tasks`. See `scripts/chat_benchmarks.py` for how each is
+scored and why the scores are reported against chance.
 
 Reported separately for operand pairs seen in training and pairs held out of both
 pretraining and SFT. Only the latter measures generalisation.
@@ -18,6 +20,8 @@ It also checks the chat machinery itself, independent of how good the model is:
   - **sampling**: pass@k at temperature > 0 through multi-sample generation.
 
     python -m scripts.chat_eval --run sft
+    python -m scripts.chat_eval --run sft --tasks ARC-Easy,MMLU --max-problems 200
+    python -m scripts.chat_eval --run sft --tasks all
 """
 
 import argparse
@@ -27,6 +31,7 @@ from nanochat.chat_format import render_prompt, reply_stop_tokens
 from nanochat.common import get_base_dir
 from nanochat.scratch import Engine, addition_pairs, list_steps, load_model
 from nanochat.tokenizer import load_tokenizer
+from scripts.chat_benchmarks import TASK_NAMES, format_results, parse_task_list, run_task
 
 
 def parse_args():
@@ -37,6 +42,9 @@ def parse_args():
     p.add_argument("--num-samples", type=int, default=4, help="k for pass@k")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--tasks", type=str, default="",
+                   help=f"benchmarks to run: 'all' or a comma list of {', '.join(TASK_NAMES)}")
+    p.add_argument("--max-problems", type=int, default=200, help="per benchmark; -1 for all")
     return p.parse_args()
 
 
@@ -105,6 +113,24 @@ def main():
         print(f"{name:16s}{f'{t1}/{n}':>10s}{f'{t2}/{n}':>10s}{f'{pk}/{n}':>10s}")
     print(f"(turn 1/2: greedy exact match; pass@{args.num_samples}: "
           f"T={args.temperature}. Only held-out rows measure generalisation.)")
+
+    task_names = parse_task_list(args.tasks)
+    if not task_names:
+        return
+    max_problems = None if args.max_problems < 0 else args.max_problems
+    print("-" * 72)
+    print(f"benchmarks (greedy; max {args.max_problems if max_problems else 'all'} problems each, "
+          f"context {model.config.sequence_len} tokens)")
+    results = {}
+    for name in task_names:
+        try:
+            results[name] = run_task(name, model, engine, tokenizer, max_problems)
+        except Exception as e:  # e.g. no network: report and carry on with the rest
+            results[name] = {"error": f"{type(e).__name__}: {e}"}
+    for line in format_results(results):
+        print(line)
+    print("(centered = (acc - chance) / (1 - chance): 0 is guessing. "
+          "Cropped prompts lost their beginning to fit the context.)")
 
 
 if __name__ == "__main__":

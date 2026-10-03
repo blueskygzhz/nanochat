@@ -6,7 +6,8 @@ https://github.com/openai/human-eval/blob/master/human_eval/execution.py
 The code runs in a fresh Python subprocess. What is covered:
 - Each execution runs in its own process (killed hard by the parent on timeout)
 - A fresh interpreter: no access to the parent process memory, and a scrubbed environment
-- Memory limits are enforced via rlimits (256MB by default)
+- Memory limits are enforced via rlimits (256MB by default, on top of the interpreter's
+  own startup footprint)
 - stdout and stderr are captured, stdin is disabled
 - Code runs in a temporary directory that is deleted afterwards
 - Destructive functions are disabled (examples: os.system, os.kill, shutil.rmtree, subprocess.Popen)
@@ -44,14 +45,31 @@ class ExecutionResult:
 # resource limits and disables destructive functions to protect against
 # accidents (a fork bomb, deleting files, killing other processes, ...).
 # It is trivially bypassable by adversarial code, see docstring above.
+#
+# The memory limit is a budget *on top of* the interpreter's own address space at
+# startup. RLIMIT_AS caps virtual memory, and a bare interpreter's virtual size
+# varies by machine (allocator arenas, mapped libraries): on some hosts it is already
+# ~240MB while using ~10MB of RAM. An absolute 256MB cap there leaves nothing, and
+# every program -- even `print(1)` -- dies with MemoryError, which silently scores
+# every HumanEval answer as wrong.
 GUARD = r"""
 import faulthandler, builtins, os, shutil, subprocess, sys
 maximum_memory_bytes = {maximum_memory_bytes}
 if maximum_memory_bytes is not None and sys.platform != "darwin":
     # (the resource limit calls seem to fail on macOS, skip them there)
     import resource
-    resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
-    resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
+    def _vm_bytes(field):
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith(field + ":"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return 0
+    for _kind, _field in ((resource.RLIMIT_AS, "VmSize"), (resource.RLIMIT_DATA, "VmData")):
+        _limit = _vm_bytes(_field) + maximum_memory_bytes
+        resource.setrlimit(_kind, (_limit, _limit))
     resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
 faulthandler.disable()
 builtins.exit = None

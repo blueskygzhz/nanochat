@@ -886,7 +886,7 @@ wheels = [
 [[package]]
 name = "nanochat"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 default-groups = []
 dependencies = [
     { name = "filelock", marker = "extra != 'extra-8-nanochat-gpu' or extra != 'extra-8-nanochat-cpu'" },
