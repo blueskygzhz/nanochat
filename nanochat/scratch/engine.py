@@ -219,7 +219,7 @@ class Engine:
         logits = np.repeat(logits, num_samples, axis=0) if num_samples > 1 else logits
 
         rows = [RowState(prompt) for _ in range(num_samples)]
-        for _ in range(max_tokens):
+        for emitted in range(max_tokens):
             next_tokens = sample_next_token(logits, rng, temperature, top_k)
             forced = [None] * num_samples
 
@@ -237,6 +237,8 @@ class Engine:
 
             if all(r.completed for r in rows):
                 break
+            if emitted == max_tokens - 1:
+                break  # the next logits would never be sampled from; don't compute them
             feed = [forced[i] if forced[i] is not None else rows[i].tokens[-1]
                     for i in range(num_samples)]
             logits = self.decode_one(feed, kv_cache)

@@ -71,16 +71,26 @@ def test_no_module_imports_torch():
 
 
 def test_scratch_package_imports_only_numpy():
-    """nanochat.scratch must depend on nothing but numpy and the standard library."""
+    """nanochat.scratch must depend on nothing but numpy and the standard library.
+
+    Checked against `sys.stdlib_module_names` rather than a hand-maintained allowlist,
+    so adding a stdlib import does not require editing this test, while adding a new
+    third-party dependency still fails.
+    """
     import pathlib
     import re
-    allowed = {"numpy", "math", "dataclasses", "nanochat"}
+    import sys
     root = pathlib.Path(__file__).resolve().parent.parent / "nanochat" / "scratch"
     pattern = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)", re.MULTILINE)
-    for path in root.glob("*.py"):
+    allowed_third_party = {"numpy"}
+    offenders = []
+    for path in sorted(root.glob("*.py")):
         for mod in pattern.findall(path.read_text(encoding="utf-8")):
             top = mod.split(".")[0]
-            assert top in allowed, f"{path.name} imports disallowed module {mod!r}"
+            if top in ("nanochat", *allowed_third_party) or top in sys.stdlib_module_names:
+                continue
+            offenders.append(f"{path.name}: {mod}")
+    assert not offenders, f"non-stdlib, non-numpy imports: {offenders}"
 
 
 @pytest.fixture

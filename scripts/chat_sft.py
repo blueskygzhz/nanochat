@@ -35,7 +35,10 @@ def parse_args():
     p.add_argument("--source", type=str, default="base", help="pretrained run to start from")
     p.add_argument("--source-step", type=int, default=None)
     p.add_argument("--run", type=str, default="sft", help="output run name")
-    p.add_argument("--num-iterations", type=int, default=200)
+    p.add_argument("--num-iterations", type=int, default=600,
+                   help="600 is where this task converges; 150 leaves single-digit "
+                        "answers off-by-one, because pretraining used zero-padded "
+                        "two-digit sums and the chat format drops the padding")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--matrix-lr", type=float, default=0.005, help="lower than pretraining")
     p.add_argument("--embedding-lr", type=float, default=0.02)
