@@ -1,5 +1,66 @@
 # Experiment Log
 
+## This fork
+
+Entries for the framework-free fork. Everything here was run on CPU with the code in
+this repository and can be reproduced with it.
+
+### 2026-10-03: Benchmarks wired in; sandbox fixed
+
+`scripts/chat_eval.py --tasks all` runs ARC-Easy/Challenge, MMLU, GSM8K and HumanEval
+from `tasks/` (scoring in `scripts/chat_benchmarks.py`: argmax over the answer letters
+for ARC/MMLU, greedy decoding + the task's own checker for GSM8K/HumanEval). On the
+default d4 / 64-token-context SFT model, 100 problems each:
+
+| task | acc | chance | centered |
+|---|---|---|---|
+| ARC-Easy | 0.220 | 0.249 | -0.039 |
+| ARC-Challenge | 0.270 | 0.250 | +0.027 |
+| MMLU | 0.320 | 0.250 | +0.093 |
+| GSM8K | 0.000 | 0.000 | 0.000 |
+| HumanEval | 0.000 | 0.000 | 0.000 |
+
+ChatCORE +0.016, i.e. chance, as expected for 229K parameters trained on addition.
+100% of prompts had to be cropped to fit the context. The deviations from chance on
+ARC/MMLU are within noise for n=100 (one standard error is ~0.043).
+
+Found while doing this: `nanochat/execution.py` set an *absolute* 256MB `RLIMIT_AS`.
+On hosts where a bare interpreter already maps ~240MB of virtual memory (while using
+~10MB of RAM), every program died with `MemoryError` — including the canonical
+HumanEval solutions, which scored 0/20. The budget is now added to the interpreter's
+startup footprint: reference solutions score 20/20, a 1GB allocation is still blocked,
+and the 7 previously failing `test_execution.py` tests pass.
+
+### 2026-10-03: Held-out evaluation; the earlier accuracy was memorisation
+
+The addition corpus has only 100 distinct problems, and every evaluation was drawn
+from the same 100. Holding out 20% of the operand pairs from pretraining *and* SFT:
+seen pairs 80/80, held-out pairs 7–14/20 across three seeds (13/20 with the default
+seed). The previously reported 99/100 measured memorisation. `base_eval`, `chat_sft`
+and `chat_eval` now report seen and held-out rows separately; the corpus spec and
+split are recorded in each checkpoint so later stages evaluate on the right pairs.
+
+### 2026-10-03: Memory and speed of the autograd engine
+
+`backward()` now frees interior gradients as it goes and releases the graph (the
+closures holding saved activations) unless `retain_graph=True`. GQA attention runs as
+one batched matmul without copying K/V, the causal mask is fused into the softmax,
+and `relu²` is a single op. d8 / T=256 training step: peak memory 1770 → 651 MB,
+step time 1049 → 901 ms; d4: 175 → 93 MB, 84 → 73 ms. float64 gradients match the
+previous implementation to 4e-9 relative.
+
+### 2026-10-03: PyTorch removed
+
+The training stack was reimplemented on numpy: reverse-mode autograd, modules,
+AdamW + Muon, the GPT/MoE model, a KV-cache engine, bits-per-byte and CORE-style
+evaluation, checkpointing. Gradients are verified against central finite differences
+in float64, not against torch. rustbpe/tiktoken became an optional extra
+(`nanochat/bpe.py` is a pure-Python BPE with identical merges and token ids).
+
+---
+
+## Upstream (historical)
+
 > **Historical.** Every experiment below was run on the PyTorch GPU training stack,
 > which has been removed from this fork. Kept for the reasoning and results; none of
 > these runs can be reproduced here.

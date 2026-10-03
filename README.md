@@ -79,6 +79,7 @@ python -m scripts.chat_sft --source base --run sft
 
 # 4. Evaluate the chat model: generated answers, second-turn answers, pass@k
 python -m scripts.chat_eval --run sft
+python -m scripts.chat_eval --run sft --tasks all --max-problems 100   # + ARC/MMLU/GSM8K/HumanEval
 
 # 5. Talk to it -- multi-turn; oldest exchanges are dropped when the context fills
 python -m scripts.chat_cli --run sft
@@ -187,11 +188,13 @@ NANOCHAT_BPE_BACKEND=rust python -m scripts.tok_train
 │   ├── base_eval.py                # 2. Evaluate the base model
 │   ├── chat_sft.py                 # 3. Finetune on conversations
 │   ├── chat_eval.py                # 4. Evaluate the chat model
+│   ├── chat_benchmarks.py          #    ARC/MMLU/GSM8K/HumanEval scoring for chat_eval --tasks
 │   ├── chat_cli.py                 # 5. Talk to it
 │   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
 │   └── tok_train.py                # Tokenizer: train it (local file or parquet shards)
 ├── tasks                           # Eval task data loaders (arc, gsm8k, mmlu, ...)
 └── tests
+    ├── test_benchmarks.py          # Benchmark scoring, offline (fake hub data, stub model)
     ├── test_bpe.py                 # BPE training/encoding, rustbpe+tiktoken parity
     ├── test_execution.py           # Sandboxed code execution
     ├── test_pipeline.py            # KV cache, engine, eval, checkpoints, tokenizers, chat
@@ -200,7 +203,25 @@ NANOCHAT_BPE_BACKEND=rust python -m scripts.tok_train
     └── test_tokenizer.py           # BPE round-trips, chat rendering
 ```
 
-`tasks/` survives untouched: it loads ARC / GSM8K / MMLU / HumanEval / SmolTalk from the HuggingFace hub. It is not wired into `chat_eval`, deliberately — a 229K-parameter byte-level model scores at chance on those benchmarks, so running them would cost downloads and minutes to print noise.
+## Standard benchmarks
+
+`chat_eval --tasks` runs the benchmarks in `tasks/` (data downloaded from the HuggingFace hub on first use and cached): ARC and MMLU by argmax over the answer letters' logits, GSM8K and HumanEval by greedy decoding checked with the task's own answer extraction / sandboxed test execution. Each score is printed beside its chance baseline and as a centered accuracy, whose mean is upstream's ChatCORE. On the default model, 100 problems each:
+
+```
+task                n     acc  chance  centered   cropped
+ARC-Easy          100   0.220   0.249    -0.039   100/100
+ARC-Challenge     100   0.270   0.250    +0.027   100/100
+MMLU              100   0.320   0.250    +0.093   100/100
+GSM8K             100   0.000   0.000    +0.000   100/100
+HumanEval         100   0.000   0.000    +0.000   100/100
+ChatCORE                                 +0.016
+```
+
+That is chance — a 229K-parameter model trained on one-digit addition knows nothing about science questions or code, and every prompt had to be cropped to fit its 64-token context. The point of running them is that the harness is real: the same commands score a capable model correctly (reference answers score 100% on all five tasks).
+
+## Packaging
+
+`pyproject.toml` builds a wheel containing the `nanochat` package only (hatchling). `uv sync` installs it in editable mode, which also puts the checkout on `sys.path`, so `scripts/` and `tasks/` stay runnable as `python -m scripts.<name>`; they are deliberately not shipped in the wheel, where they would occupy the generic top-level names `scripts` and `tasks`.
 
 ## Acknowledgements
 

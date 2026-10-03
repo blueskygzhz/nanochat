@@ -2,9 +2,15 @@
 
 > **Not applicable to this fork.** The "Time-to-GPT-2" leaderboard requires the
 > PyTorch training stack (8×H100, FlashAttention, FP8, distributed training), all of
-> which was removed from this fork. The CORE evaluation and `runs/speedrun.sh` no
-> longer exist here. This file is kept as upstream reference only — see
+> which was removed from this fork. This file is kept as upstream reference only — see
 > [karpathy/nanochat](https://github.com/karpathy/nanochat) to actually participate.
+>
+> Names below that also exist in this fork refer to *different* things here:
+> `runs/speedrun.sh` is a ~2-minute CPU pipeline on an addition task, not the GPT-2
+> run; `scripts/base_eval.py` reports bits-per-byte and a CORE-*style* multiple-choice
+> score on that task, not the 22-task DCLM CORE metric; and the `torchrun` commands
+> and flags (`--fp8`, `--device-batch-size`, `--target-param-data-ratio`, ...) do not
+> exist. Nothing on this page can be reproduced with this repository.
 
 Docs on participating in the "Time-to-GPT-2" leaderboard of nanochat.
 

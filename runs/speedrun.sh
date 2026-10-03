@@ -71,7 +71,8 @@ banner "3/5  Finetune on conversations ($SFT_STEPS steps)"
     --run sft
 
 banner "4/5  Evaluate the chat model"
-"$PY" -m scripts.chat_eval --run sft
+# CHAT_TASKS=all (or e.g. ARC-Easy,MMLU) adds the standard benchmarks; needs network
+"$PY" -m scripts.chat_eval --run sft ${CHAT_TASKS:+--tasks "$CHAT_TASKS" --max-problems 100}
 
 banner "5/5  Talk to it"
 for q in "2+3" "7+8" "9+9"; do
