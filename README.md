@@ -13,16 +13,18 @@ bash runs/speedrun.sh   # the full pipeline: pretrain → eval → SFT → chat
 ```
 === 1/4  Pretrain ===
 base_train | dense d4 w64 | 229,458 params | vocab 256
-step     0 | train 5.5446 | val bpb 7.83 |    0.4s
-step   399 | train 0.6813 | val bpb 0.999 |   34.7s
+task: addition | 80 train pairs, 20 held out | bpb floor 0.9031
+done in 45.8s | final val bpb 0.9557
 
 === 2/4  Evaluate the base model ===
-val bits per byte : 0.9994   (entropy floor 0.9491, gap +0.0502)
-addition (MC)     : 1.000    (chance 0.500, n=100)
-greedy exact match: 10/10
+val bits per byte : 0.9558   entropy floor 0.9031, gap +0.0526
+                      MC acc      greedy
+seen pairs             1.000       80/80
+held-out pairs         0.700       13/20
 
 === 3/4  Finetune on conversations ===
-step   599 | train 0.0000 | val 0.0000 | exact match: 5/5
+seen pairs      : exact match 80/80
+held-out pairs  : exact match 15/20
 
 === 4/4  Talk to it ===
 You: 2+3   Bot: 5
@@ -31,6 +33,12 @@ You: 9+9   Bot: 18
 ```
 
 Total wall time: ~2 minutes on one CPU core.
+
+**Read the held-out row, not the seen row.** There are only 100 distinct problems, so
+perfect seen-pair accuracy is reachable by memorisation alone. 20% of the operand pairs
+are therefore kept out of pretraining *and* SFT (`--holdout-frac`), and only accuracy on
+those says whether the model learned to add. At this scale it partially does: across
+seeds, held-out greedy accuracy ranges from roughly 35% to 75%.
 
 ## Read this first: what this fork is and is not
 
@@ -42,7 +50,7 @@ The upstream project trains a GPT-2 capability model on an 8×H100 node in under
 - MLA, MTP, and the 7.26B-total MoE run
 - GPT-2 / GPT-3 parity, the speedrun leaderboard
 
-What is left runs single-threaded float32 on CPU with naive O(T²) attention, so it is many orders of magnitude slower. Its demonstrated capability is a 229K-parameter model that learns one-digit addition in ~2 minutes end-to-end.
+What is left runs single-threaded float32 on CPU with naive O(T²) attention, so it is many orders of magnitude slower. Its demonstrated capability is a 229K-parameter model that, in ~2 minutes end-to-end, memorises the one-digit addition problems it was shown and solves 35–75% of held-out ones, depending on seed.
 
 **If you want to train a usable language model, use [upstream nanochat](https://github.com/karpathy/nanochat).** This fork exists to make every step of training readable — there is no layer you cannot step into with a debugger.
 
@@ -83,15 +91,17 @@ python -m scripts.scratch_train --text-file book.txt   # any UTF-8 corpus
 | `nanochat/scratch/data.py` | `nanochat/dataloader.py` | 115 | Byte tokenizer, random batches, sequential evaluation batches, the addition corpus with its known entropy floor |
 | `nanochat/bpe.py` | `rustbpe`, `tiktoken` | 402 | Byte-level BPE: training (merge counting with incremental updates) and inference, standard library only |
 
-## The default task: two-digit addition
+## The default task: one-digit addition
 
-The default corpus is `"7+5=12;"` repeated 20,000 times with random operands. Its entropy is known exactly, so there is a real number to aim at rather than just a curve that goes down. Every character of a line is determined by the two operands, so the only information in the stream is those operands:
+The default corpus is `"7+5=12;"` repeated 20,000 times, with operands drawn from the 80 training pairs (the other 20 are held out). Its entropy is known exactly, so there is a real number to aim at rather than just a curve that goes down. Every character of a line is determined by which operand pair it is, so the only information in the stream is that choice:
 
 \[
-H = \frac{2\ln 10}{7} = 0.6579 \text{ nats/token} = 0.9491 \text{ bits/byte}
+H = \frac{\ln N_\text{pairs}}{7} = \frac{\ln 80}{7} = 0.6260 \text{ nats/token} = 0.9031 \text{ bits/byte}
 \]
 
-A model that reaches bpb ~0.95 has learned to carry. One stuck at ~7.8 has only learned character frequencies (the baseline for a random model over 256 bytes is log₂(256) = 8.0 bits/byte).
+(With `--holdout-frac 0` all 100 pairs are used and the floor is \(2\ln 10 / 7\) = 0.9491 bits/byte.) A model near the floor has learned the training problems; one stuck at ~7.8 has only learned character frequencies (the random baseline over 256 bytes is log₂(256) = 8.0 bits/byte). Neither number says anything about unseen problems — that is what the held-out evaluation is for.
+
+The corpus spec, including the held-out split, is written into every checkpoint's `meta.json`. `base_eval` and `chat_sft` rebuild the data from it, so they always evaluate against what the model was actually trained on, and `--resume` refuses to continue a run on different data.
 
 ## How the gradients are verified
 

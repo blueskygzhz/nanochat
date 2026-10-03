@@ -11,6 +11,10 @@ in bits-per-byte, checkpointing, and resume -- at a scale that finishes on a CPU
 
 `--depth` is the single complexity dial, as upstream: it sets the number of layers and
 derives width, heads and the learning rate from it, so there is one number to turn.
+
+On the default addition corpus, `--holdout-frac` of the operand pairs never appear in
+training. The corpus spec (including that split) is written into every checkpoint,
+so `base_eval` and `chat_sft` evaluate on exactly the pairs this run never saw.
 """
 
 import argparse
@@ -22,9 +26,9 @@ import numpy as np
 
 from nanochat.common import get_base_dir
 from nanochat.scratch import (
-    ByteTokenizer, Dataset, GPT, GPTConfig, addition_entropy_floor, evaluate_bpb,
-    find_last_step, load_checkpoint, make_addition_corpus, no_grad, save_checkpoint,
-    setup_optimizer, token_bytes_table,
+    ByteTokenizer, Dataset, GPT, GPTConfig, build_corpus, corpus_spec, evaluate_bpb,
+    find_last_step, load_checkpoint, no_grad, save_checkpoint, setup_optimizer,
+    token_bytes_table,
 )
 
 
@@ -60,7 +64,9 @@ def parse_args():
     # data
     p.add_argument("--text-file", type=str, default=None)
     p.add_argument("--corpus-lines", type=int, default=20000)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--holdout-frac", type=float, default=0.2,
+                   help="fraction of addition operand pairs kept out of training entirely")
+    p.add_argument("--seed", type=int, default=0, help="seeds init, data and the held-out split")
     return p.parse_args()
 
 
@@ -112,13 +118,9 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     tokenizer = ByteTokenizer()
-    if args.text_file:
-        with open(args.text_file, encoding="utf-8") as f:
-            text = f.read()
-        floor = None
-    else:
-        text = make_addition_corpus(args.corpus_lines, seed=args.seed)
-        floor = addition_entropy_floor()
+    spec = corpus_spec(args.text_file, args.corpus_lines, args.seed, args.holdout_frac)
+    text, info = build_corpus(spec)
+    floor = info["floor"]
     dataset = Dataset.from_text(text, tokenizer)
     token_bytes = token_bytes_table(tokenizer)
 
@@ -126,7 +128,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     config = derive_config(args, tokenizer.get_vocab_size())
-    model = GPT(config)
+    model = GPT(config, seed=args.seed)
     optimizer = setup_optimizer(
         model, unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr,
         matrix_lr=args.matrix_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay)
@@ -138,6 +140,11 @@ def main():
             print(f"--resume: nothing to resume in {out_dir}, starting fresh")
         else:
             model, meta = load_checkpoint(out_dir, last, model=model, optimizer=optimizer)
+            # Resuming onto different data would silently produce a model trained on
+            # a mixture that no checkpoint describes, and could leak held-out pairs.
+            if meta.get("data") not in (None, spec):
+                raise SystemExit(f"--resume: checkpoint was trained on {meta['data']}, "
+                                 f"but this run is configured for {spec}")
             start_step = meta["step"] + 1
             print(f"resumed from step {meta['step']} (val bpb {meta.get('val_bpb', float('nan')):.4f})")
 
@@ -150,12 +157,14 @@ def main():
     print(f"{len(dataset.train):,} train / {len(dataset.val):,} val tokens | "
           f"{tokens_per_step:,} tokens/step x {args.num_iterations} steps")
     if floor is not None:
-        print(f"task: 2-digit addition | loss floor {floor:.4f} nats "
+        print(f"task: addition | {len(info['train_pairs'])} train pairs, "
+              f"{len(info['heldout_pairs'])} held out | loss floor {floor:.4f} nats "
               f"| bpb floor {floor / math.log(2):.4f}")
     print(f"checkpoints -> {out_dir}")
     print("-" * 76)
 
     t0 = time.time()
+    bpb = None
     for step in range(start_step, args.num_iterations):
         scale = lr_scale(step, args.num_iterations, args.warmup_ratio, args.final_lr_frac)
         for group, base in zip(optimizer.param_groups, base_lrs):
@@ -172,17 +181,20 @@ def main():
         optimizer.step()
 
         is_last = step == args.num_iterations - 1
+        bpb = None  # evaluated at most once per step, then shared by log and checkpoint
         if (args.eval_every > 0 and step % args.eval_every == 0) or is_last:
             bpb = eval_bpb(model, dataset, token_bytes, args)
             print(f"step {step:5d} | train {total:.4f} | val bpb {bpb:.4f} "
                   f"| lr x{scale:.2f} | {time.time() - t0:6.1f}s")
         if (args.save_every > 0 and step % args.save_every == 0) or is_last:
+            if bpb is None:
+                bpb = eval_bpb(model, dataset, token_bytes, args)
             save_checkpoint(out_dir, step, model, optimizer,
-                            meta={"val_bpb": eval_bpb(model, dataset, token_bytes, args),
-                                  "train_loss": total, "depth": args.depth})
+                            meta={"val_bpb": bpb, "train_loss": total, "depth": args.depth,
+                                  "seed": args.seed, "data": spec})
 
     print("-" * 76)
-    final = eval_bpb(model, dataset, token_bytes, args)
+    final = bpb if bpb is not None else eval_bpb(model, dataset, token_bytes, args)
     print(f"done in {time.time() - t0:.1f}s | final val bpb {final:.4f}")
     if floor is not None:
         print(f"gap to bpb floor: {final - floor / math.log(2):+.4f}")

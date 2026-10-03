@@ -197,6 +197,10 @@ def setup_optimizer(model, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.0
       - 2-D hidden weights -> Muon
       - per-layer scalars (resid/x0/smear/backout lambdas) are 1-D and get a much
         higher learning rate, since they are few and start near their neutral value
+
+    Weight decay applies to the Muon matrices only, as upstream. Decaying the
+    AdamW groups would be actively harmful: it pulls `resid_lambdas` (init ~1.0,
+    the residual path's gain) and the embeddings towards zero.
     """
     named = dict(model.named_parameters())
     embedding_names = {n for n in named if n.startswith("wte.") or n.startswith("value_embeds.")}
@@ -222,5 +226,5 @@ def setup_optimizer(model, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.0
         adamw_groups.append({"params": scalars, "lr": scalar_lr})
 
     muon = Muon(matrices, lr=matrix_lr, weight_decay=weight_decay)
-    adamw = AdamW(adamw_groups, lr=unembedding_lr, weight_decay=weight_decay)
+    adamw = AdamW(adamw_groups, lr=unembedding_lr, weight_decay=0.0)
     return MuonAdamW(muon, adamw)

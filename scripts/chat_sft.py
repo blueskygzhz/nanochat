@@ -24,7 +24,7 @@ import numpy as np
 
 from nanochat.common import get_base_dir
 from nanochat.scratch import (
-    ByteTokenizer, Engine, find_last_step, load_checkpoint, load_model, no_grad,
+    ByteTokenizer, Engine, addition_pairs, load_model, no_grad,
     save_checkpoint, setup_optimizer,
 )
 
@@ -55,13 +55,17 @@ def parse_args():
 # Upstream pulls SmolTalk from HuggingFace. At this scale that is pointless, so the
 # task is arithmetic Q&A: it is checkable, and it shares a domain with what the base
 # model was pretrained on, which is what makes finetuning show up as a real change.
+#
+# Conversations are drawn only from the operand pairs the base model was pretrained
+# on. The held-out pairs stay unseen through both stages, so they remain a clean test.
 
-def make_conversations(n=400, seed=0):
+def make_conversations(n=400, seed=0, pairs=None):
     import random
     rng = random.Random(seed)
+    pairs = pairs or [(a, b) for a in range(10) for b in range(10)]
     out = []
     for _ in range(n):
-        a, b = rng.randrange(10), rng.randrange(10)
+        a, b = rng.choice(pairs)
         out.append([
             {"role": "user", "content": f"{a}+{b}"},
             {"role": "assistant", "content": f"{a + b}"},
@@ -138,8 +142,16 @@ def main():
     model.train()
     tokenizer = ByteTokenizer()
     seq_len = model.config.sequence_len
-    train_convs = make_conversations(400, seed=args.seed)
-    val_convs = make_conversations(80, seed=args.seed + 999)
+
+    # Inherit the base model's held-out split so SFT never sees those pairs either
+    spec = meta.get("data")
+    if spec is not None and spec.get("kind") == "addition":
+        train_pairs, held_pairs = addition_pairs(spec["holdout_frac"], spec["seed"])
+    else:
+        print("warning: source checkpoint has no addition split; nothing is held out")
+        train_pairs, held_pairs = addition_pairs(0.0)
+    train_convs = make_conversations(400, seed=args.seed, pairs=train_pairs)
+    val_convs = make_conversations(80, seed=args.seed + 999, pairs=train_pairs)
 
     optimizer = setup_optimizer(
         model, unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr,
@@ -172,24 +184,33 @@ def main():
 
     save_checkpoint(out_dir, args.num_iterations - 1, model, optimizer,
                     meta={"source": args.source, "source_step": meta["step"],
+                          "data": spec,
                           "val_loss": eval_loss(model, tokenizer, val_convs, args, seq_len)})
     print("-" * 72)
 
-    # Does it answer in the finetuned format?
+    # Does it answer in the finetuned format -- on pairs it trained on, and on pairs
+    # neither pretraining nor SFT ever showed it?
     model.eval()
     engine = Engine(model, tokenizer)
-    print("samples:")
+    for name, pairs in (("seen pairs", train_pairs), ("held-out pairs", held_pairs)):
+        if not pairs:
+            print(f"{name:16s}: n/a (no pairs held out)")
+            continue
+        correct = chat_exact_match(engine, tokenizer, pairs)
+        print(f"{name:16s}: exact match {correct}/{len(pairs)}")
+    print("(only the held-out row measures generalisation)")
+    print(f"next: python -m scripts.chat_cli --run {args.run}")
+
+
+def chat_exact_match(engine, tokenizer, pairs):
+    """Greedy-decode the assistant turn for `a+b` and compare against the sum."""
     correct = 0
-    for a, b in [(2, 3), (7, 8), (4, 4), (9, 1), (0, 5)]:
+    for a, b in pairs:
         ids, _ = render_conversation(tokenizer, [{"role": "user", "content": f"{a}+{b}"}])
         ids = ids + tokenizer.encode("A:")
         got = tokenizer.decode(engine.generate_batch(ids, max_tokens=4, temperature=0.0)[0])
-        answer = got.split("\n")[0].strip()
-        ok = answer == str(a + b)
-        correct += ok
-        print(f"  U:{a}+{b} -> A:{answer!r}{'' if ok else f'  (want {a + b})'}")
-    print(f"\nexact match: {correct}/5")
-    print(f"next: python -m scripts.chat_cli --run {args.run}")
+        correct += got.split("\n")[0].strip() == str(a + b)
+    return correct
 
 
 if __name__ == "__main__":

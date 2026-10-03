@@ -32,7 +32,8 @@ from nanochat.scratch.checkpoint import (
     build_model, find_last_step, list_steps, load_checkpoint, load_model, save_checkpoint,
 )
 from nanochat.scratch.data import (
-    ByteTokenizer, Dataset, addition_entropy_floor, make_addition_corpus,
+    ByteTokenizer, Dataset, addition_entropy_floor, addition_pairs, build_corpus,
+    corpus_spec, make_addition_corpus,
 )
 from nanochat.scratch.engine import Engine, KVCache, sample_next_token
 from nanochat.scratch.eval import evaluate_bpb, evaluate_task, token_bytes_table
@@ -49,6 +50,7 @@ __all__ = [
     "AdamW", "Muon", "MuonAdamW", "setup_optimizer", "polar_express",
     # data
     "ByteTokenizer", "Dataset", "make_addition_corpus", "addition_entropy_floor",
+    "addition_pairs", "corpus_spec", "build_corpus",
     # inference
     "Engine", "KVCache", "sample_next_token",
     # evaluation

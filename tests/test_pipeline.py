@@ -16,9 +16,9 @@ import pytest
 
 from nanochat.scratch import (
     ByteTokenizer, Dataset, Engine, GPT, GPTConfig, KVCache, Tensor,
-    build_model, evaluate_bpb, evaluate_task, find_last_step, list_steps,
-    load_checkpoint, load_model, make_addition_corpus, sample_next_token,
-    save_checkpoint, setup_optimizer, token_bytes_table,
+    addition_pairs, build_corpus, build_model, corpus_spec, evaluate_bpb, evaluate_task,
+    find_last_step, list_steps, load_checkpoint, load_model, make_addition_corpus,
+    sample_next_token, save_checkpoint, setup_optimizer, token_bytes_table,
 )
 from nanochat.scratch import eval as seval
 
@@ -255,6 +255,76 @@ def test_engine_generate_streams_token_and_index(tiny_model, tokenizer):
     assert len(events) == 6
     assert {i for _, i in events} == {0, 1}
     assert all(isinstance(t, int) for t, _ in events)
+
+
+class ToolTokenizer(ByteTokenizer):
+    """A byte tokenizer that also knows the four tool special tokens.
+
+    They are mapped onto control bytes that never occur in the arithmetic text, which
+    is all the engine needs: it only ever compares ids and decodes the expression.
+    """
+
+    SPECIAL = {"<|bos|>": ord(";"), "<|python_start|>": 1, "<|python_end|>": 2,
+               "<|output_start|>": 3, "<|output_end|>": 4}
+
+    def encode_special(self, name):
+        if name not in self.SPECIAL:
+            raise KeyError(f"Unknown special token: {name}")
+        return self.SPECIAL[name]
+
+
+class ScriptedModel(StubModel):
+    """Emits `script[k]` as the argmax on its k-th forward, whatever the input, and
+    records every input it is fed. That separates "what the model wanted" from "what
+    the engine emitted", which is exactly the distinction forced tokens create."""
+
+    def __init__(self, script, **kwargs):
+        super().__init__(favoured=0, **kwargs)
+        self.script = list(script)
+        self.fed = []
+
+    def __call__(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
+        idx = np.asarray(idx)
+        B, T = idx.shape
+        self.fed.append(idx.copy())
+        logits = np.zeros((B, T, self.vocab_size), dtype=np.float32)
+        logits[:, :, self.script[min(len(self.fed) - 1, len(self.script) - 1)]] = 10.0
+        if kv_cache is not None:
+            kv_cache.advance(T)
+        return Tensor(logits)
+
+
+def test_engine_splices_the_calculator_result_into_the_stream():
+    """`<|python_start|>2+3<|python_end|>` must be followed by the *tool's* tokens
+    `<|output_start|>5<|output_end|>`, overriding whatever the model sampled, and
+    those tokens must be fed back through the model so the cache contains them."""
+    tok = ToolTokenizer()
+    S, E, OS, OE = 1, 2, 3, 4
+    junk, after = ord("x"), ord("!")
+    # what the model *wants* to emit at each step; steps 5..7 are overridden
+    script = [S, ord("2"), ord("+"), ord("3"), E, junk, junk, junk, after]
+    model = ScriptedModel(script)
+    out = Engine(model, tok).generate_batch(tok.encode("ab"), max_tokens=9,
+                                           temperature=0.0, use_tools=True)[0]
+
+    assert out == [S, ord("2"), ord("+"), ord("3"), E, OS, ord("5"), OE, after], out
+    fed = [int(x[0, 0]) for x in model.fed[1:]]  # decode steps, after the prefill
+    assert fed == out[:-1], "every emitted token, forced or not, must be fed back"
+
+
+def test_engine_emits_no_output_block_for_a_refused_expression():
+    tok = ToolTokenizer()
+    S, E = 1, 2
+    script = [S, ord("a"), E, ord("!"), ord("!")]
+    out = Engine(ScriptedModel(script), tok).generate_batch(
+        tok.encode("ab"), max_tokens=5, temperature=0.0, use_tools=True)[0]
+    assert out == [S, ord("a"), E, ord("!"), ord("!")], "refused => keep sampling"
+
+
+def test_engine_tools_require_the_special_tokens(tiny_model, tokenizer):
+    with pytest.raises(ValueError, match="tool special tokens"):
+        Engine(tiny_model, tokenizer).generate_batch(tokenizer.encode("ab"), max_tokens=2,
+                                                     use_tools=True)
 
 
 def test_use_calculator_evaluates_and_refuses():
@@ -562,6 +632,76 @@ def test_byte_tokenizer_bos_is_in_distribution(tokenizer):
     corpus = make_addition_corpus(50, seed=0)
     assert tokenizer.get_bos_token_id() == ord(";")
     assert tokenizer.get_bos_token_id() in set(tokenizer.encode(corpus))
+
+
+# ----------------------------------------------------------------------------
+# held-out evaluation and corpus provenance
+
+def test_addition_pairs_partition_all_100_and_are_deterministic():
+    train, held = addition_pairs(0.2, seed=3)
+    assert len(train) == 80 and len(held) == 20
+    assert not set(train) & set(held), "a pair cannot be both seen and held out"
+    assert set(train) | set(held) == {(a, b) for a in range(10) for b in range(10)}
+    assert addition_pairs(0.2, seed=3) == (train, held)
+    assert addition_pairs(0.2, seed=4) != (train, held)
+    assert addition_pairs(0.0) == (sorted(train + held), [])
+
+
+def test_held_out_pairs_never_reach_the_training_corpus():
+    train, held = addition_pairs(0.2, seed=0)
+    text = make_addition_corpus(5000, seed=0, pairs=train)
+    lines = {text[i:i + 7] for i in range(0, len(text), 7)}
+    assert lines == {f"{a}+{b}={a + b:02d};" for a, b in train}
+    for a, b in held:
+        assert f";{a}+{b}=" not in ";" + text
+
+
+def test_entropy_floor_scales_with_the_number_of_pairs():
+    from nanochat.scratch import addition_entropy_floor
+    np.testing.assert_allclose(addition_entropy_floor(), 2 * math.log(10) / 7)
+    np.testing.assert_allclose(addition_entropy_floor(80), math.log(80) / 7)
+
+
+def test_corpus_spec_round_trips_through_checkpoint_meta(tiny_model, tmp_path):
+    """The spec must survive JSON, and rebuilding from it must give the same data."""
+    spec = corpus_spec(corpus_lines=300, seed=5, holdout_frac=0.25)
+    save_checkpoint(str(tmp_path), 0, tiny_model, meta={"data": spec})
+    _, meta = load_model(str(tmp_path))
+    assert meta["data"] == spec
+    text_a, info_a = build_corpus(spec)
+    text_b, info_b = build_corpus(meta["data"])
+    assert text_a == text_b and info_a == info_b
+    assert len(info_a["heldout_pairs"]) == 25
+
+
+def test_text_corpus_spec_reads_the_file(tmp_path):
+    path = tmp_path / "book.txt"
+    path.write_text("hello world", encoding="utf-8")
+    text, info = build_corpus(corpus_spec(text_file=str(path)))
+    assert text == "hello world"
+    assert info == {"floor": None, "train_pairs": None, "heldout_pairs": None}
+    with pytest.raises(ValueError, match="unknown corpus kind"):
+        build_corpus({"kind": "nope"})
+
+
+# ----------------------------------------------------------------------------
+# optimizer and init hygiene
+
+def test_weight_decay_applies_to_muon_matrices_only(tiny_model):
+    opt = setup_optimizer(tiny_model, weight_decay=0.1)
+    assert all(g["weight_decay"] == 0.1 for g in opt.muon.param_groups)
+    assert all(g["weight_decay"] == 0.0 for g in opt.adamw.param_groups), \
+        "decaying AdamW groups would pull resid_lambdas and embeddings towards zero"
+
+
+def test_init_seed_controls_the_weights():
+    config = GPTConfig(n_layer=2, n_head=4, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64)
+    a, b, c = GPT(config, seed=1), GPT(config, seed=1), GPT(config, seed=2)
+    for (name, pa), (_, pb), (_, pc) in zip(a.named_parameters(), b.named_parameters(),
+                                            c.named_parameters()):
+        np.testing.assert_array_equal(pa.data, pb.data, err_msg=name)
+    assert not np.array_equal(a.wte.weight.data, c.wte.weight.data)
 
 
 # ----------------------------------------------------------------------------

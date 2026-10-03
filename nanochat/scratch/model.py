@@ -258,9 +258,10 @@ class Block(nn.Module):
 class GPT(nn.Module):
     SMEAR_GATE_CHANNELS = 24
 
-    def __init__(self, config):
+    def __init__(self, config, seed=0):
         super().__init__()
         self.config = config
+        self.seed = seed
         self.window_sizes = self._compute_window_sizes(config)
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)])
@@ -306,8 +307,11 @@ class GPT(nn.Module):
         zero (so each block is an identity map at step 0 and the residual stream is
         clean), and `resid_lambdas`/`x0_lambdas` decay with depth so early layers
         lean on the embedding and deep layers lean on the residual.
+
+        Every random draw comes from `self.seed`, so two models with the same config
+        and seed are bit-identical and different seeds give independent inits.
         """
-        rng = np.random.default_rng(0)
+        rng = np.random.default_rng(self.seed)
         dt = get_dtype()
         n_embd = self.config.n_embd
         s = 3 ** 0.5 * n_embd ** -0.5  # sqrt(3) makes Uniform match Normal's std

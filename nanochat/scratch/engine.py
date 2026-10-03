@@ -17,9 +17,11 @@ speculative decoding with an MTP draft head (there is no MTP head here), and the
 MLA compressed cache.
 """
 
+from collections import deque
+
 import numpy as np
 
-from nanochat.scratch.tensor import Tensor, no_grad
+from nanochat.scratch.tensor import no_grad
 
 __all__ = ["KVCache", "Engine", "sample_next_token", "use_calculator"]
 
@@ -157,13 +159,20 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 # ----------------------------------------------------------------------------
 
 class RowState:
-    """Per-sample generation state: the tokens so far, and whether we're in a tool call."""
+    """Per-sample generation state.
+
+    `forced` is the queue of tokens the engine will emit next *instead of* sampling.
+    The tool loop fills it with `<|output_start|> result <|output_end|>`; they are
+    yielded and fed back through the model like any other token, so the KV cache
+    holds them and the model conditions on the tool's answer.
+    """
 
     def __init__(self, tokens):
         self.tokens = list(tokens)
         self.completed = False
         self.in_python_block = False
         self.python_expr = []
+        self.forced = deque()
 
 
 class Engine:
@@ -218,18 +227,18 @@ class Engine:
         kv_cache = shared if num_samples == 1 else shared.expand(num_samples)
         logits = np.repeat(logits, num_samples, axis=0) if num_samples > 1 else logits
 
+        pad = self.tokenizer.get_bos_token_id()
         rows = [RowState(prompt) for _ in range(num_samples)]
         for emitted in range(max_tokens):
             next_tokens = sample_next_token(logits, rng, temperature, top_k)
-            forced = [None] * num_samples
 
             for i, row in enumerate(rows):
                 if row.completed:
-                    forced[i] = self.tokenizer.get_bos_token_id()  # padding, not emitted
                     continue
-                token = int(next_tokens[i])
+                # A queued tool result takes precedence over the model's own sample
+                token = row.forced.popleft() if row.forced else int(next_tokens[i])
                 if tool_ids is not None:
-                    token = self._step_tools(row, token, tool_ids)
+                    self._step_tools(row, token, tool_ids)
                 row.tokens.append(token)
                 yield token, i
                 if token in stop:
@@ -239,8 +248,8 @@ class Engine:
                 break
             if emitted == max_tokens - 1:
                 break  # the next logits would never be sampled from; don't compute them
-            feed = [forced[i] if forced[i] is not None else rows[i].tokens[-1]
-                    for i in range(num_samples)]
+            # Finished rows still occupy a batch slot; feed them padding, never emitted
+            feed = [pad if r.completed else r.tokens[-1] for r in rows]
             logits = self.decode_one(feed, kv_cache)
 
     def generate_batch(self, tokens, **kwargs):
@@ -271,22 +280,23 @@ class Engine:
             raise ValueError(f"tokenizer lacks the tool special tokens: {e}") from None
 
     def _step_tools(self, row, token, tool_ids):
-        """Track the python block and, on close, splice the result back in.
+        """Track the python block and, on close, queue the result to be spliced in.
 
         The model emits `<|python_start|> expr <|python_end|>`; we evaluate `expr` and
         the caller sees `<|output_start|> result <|output_end|>` appear next, exactly
-        as if the model had produced it.
+        as if the model had produced it. An expression the calculator refuses yields
+        no output block, and the model simply carries on sampling.
         """
         if token == tool_ids["<|python_start|>"]:
             row.in_python_block = True
             row.python_expr = []
         elif token == tool_ids["<|python_end|>"] and row.in_python_block:
             row.in_python_block = False
-            expr = self.tokenizer.decode(row.python_expr)
-            result = use_calculator(expr)
+            result = use_calculator(self.tokenizer.decode(row.python_expr))
             row.python_expr = []
             if result is not None:
-                row.pending_output = self.tokenizer.encode(str(result))
+                row.forced.append(tool_ids["<|output_start|>"])
+                row.forced.extend(self.tokenizer.encode(str(result)))
+                row.forced.append(tool_ids["<|output_end|>"])
         elif row.in_python_block:
             row.python_expr.append(token)
-        return token

@@ -9,13 +9,25 @@ the line's two operands, so the only information in the stream is those operands
     H(line) = 2 * ln(10) = 4.6052 nats  over 7 characters
     => floor = 4.6052 / 7 = 0.6579 nats/token
 
-A model that reaches ~0.66 has learned to carry. One that sits at ~2.3 has only
+A model that reaches ~0.66 has learned the table. One that sits at ~2.3 has only
 learned the character frequencies.
+
+**Memorisation vs generalisation.** There are only 100 distinct problems, so a
+model can reach the floor by memorising all of them, and any evaluation drawn from
+the same 100 problems cannot tell the difference. `addition_pairs` therefore holds
+out a fraction of the `(a, b)` pairs: they never appear in training, and the
+evaluation scripts report accuracy on seen and held-out pairs separately. Only the
+held-out number says anything about whether the model learned to add.
 """
+
+import os
 
 import numpy as np
 
-__all__ = ["ByteTokenizer", "make_addition_corpus", "addition_entropy_floor", "Dataset"]
+__all__ = [
+    "ByteTokenizer", "make_addition_corpus", "addition_entropy_floor", "addition_pairs",
+    "corpus_spec", "build_corpus", "Dataset",
+]
 
 ADDITION_LINE_LEN = 7  # e.g. "7+5=12;"
 
@@ -75,17 +87,81 @@ class ByteTokenizer:
         return self.vocab_size
 
 
-def make_addition_corpus(n_lines=20000, seed=0):
-    """`a+b=cc;` for random single digits a, b, with the sum zero-padded to 2 digits."""
+def addition_pairs(holdout_frac=0.2, seed=0):
+    """Split the 100 `(a, b)` operand pairs into `(train_pairs, heldout_pairs)`.
+
+    Deterministic in `seed`, so every script that knows the split parameters (they
+    are recorded in the checkpoint's meta) reconstructs exactly the same split.
+    """
+    if not 0.0 <= holdout_frac < 1.0:
+        raise ValueError("holdout_frac must be in [0, 1)")
+    pairs = [(a, b) for a in range(10) for b in range(10)]
+    order = np.random.default_rng(seed).permutation(len(pairs))
+    n_held = int(round(len(pairs) * holdout_frac))
+    held = sorted(pairs[i] for i in order[:n_held])
+    train = sorted(pairs[i] for i in order[n_held:])
+    return train, held
+
+
+def make_addition_corpus(n_lines=20000, seed=0, pairs=None):
+    """`a+b=cc;` lines with the sum zero-padded to 2 digits.
+
+    With `pairs=None` the operands are uniform single digits. Otherwise each line is
+    drawn uniformly from `pairs`, which is how held-out pairs are kept out of training.
+    """
     rng = np.random.default_rng(seed)
-    a = rng.integers(0, 10, n_lines)
-    b = rng.integers(0, 10, n_lines)
+    if pairs is None:
+        a = rng.integers(0, 10, n_lines)
+        b = rng.integers(0, 10, n_lines)
+    else:
+        pairs = np.asarray(pairs, dtype=np.int64)
+        if pairs.ndim != 2 or len(pairs) == 0:
+            raise ValueError("pairs must be a non-empty list of (a, b)")
+        chosen = pairs[rng.integers(0, len(pairs), n_lines)]
+        a, b = chosen[:, 0], chosen[:, 1]
     return "".join(f"{x}+{y}={x + y:02d};" for x, y in zip(a, b))
 
 
-def addition_entropy_floor():
-    """Cross-entropy a perfect model would reach on the addition corpus, in nats/token."""
-    return 2.0 * np.log(10.0) / ADDITION_LINE_LEN
+def addition_entropy_floor(n_pairs=100):
+    """Cross-entropy a perfect model would reach, in nats/token.
+
+    The only information in a line is which operand pair it is, so the floor is
+    ln(n_pairs) spread over the line's characters. 100 pairs gives 2*ln(10)/7.
+    """
+    return float(np.log(n_pairs)) / ADDITION_LINE_LEN
+
+
+# ----------------------------------------------------------------------------
+# corpus provenance
+#
+# A checkpoint is only interpretable together with the data it was trained on. The
+# training script records a small JSON-able spec in the checkpoint's meta, and every
+# downstream script rebuilds the corpus (and the held-out split) from that spec rather
+# than from its own command-line defaults.
+
+def corpus_spec(text_file=None, corpus_lines=20000, seed=0, holdout_frac=0.2):
+    if text_file:
+        return {"kind": "text", "path": os.path.abspath(text_file)}
+    return {"kind": "addition", "corpus_lines": int(corpus_lines), "seed": int(seed),
+            "holdout_frac": float(holdout_frac)}
+
+
+def build_corpus(spec):
+    """Rebuild a corpus from its spec.
+
+    Returns `(text, info)`. For the addition task `info` carries the entropy floor
+    and the seen/held-out pair split; for a text file both are None.
+    """
+    kind = spec.get("kind")
+    if kind == "text":
+        with open(spec["path"], encoding="utf-8") as f:
+            return f.read(), {"floor": None, "train_pairs": None, "heldout_pairs": None}
+    if kind == "addition":
+        train, held = addition_pairs(spec["holdout_frac"], spec["seed"])
+        text = make_addition_corpus(spec["corpus_lines"], seed=spec["seed"], pairs=train)
+        return text, {"floor": addition_entropy_floor(len(train)),
+                      "train_pairs": train, "heldout_pairs": held}
+    raise ValueError(f"unknown corpus kind: {kind!r}")
 
 
 class Dataset:
