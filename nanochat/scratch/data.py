@@ -164,6 +164,37 @@ def build_corpus(spec):
     raise ValueError(f"unknown corpus kind: {kind!r}")
 
 
+def has_dedicated_bos(tokenizer):
+    """True if BOS is a special token rather than an ordinary byte (as in ByteTokenizer)."""
+    return "<|bos|>" in tokenizer.get_special_tokens()
+
+
+def encode_corpus(text, tokenizer, spec):
+    """Corpus text -> token ids, with BOS placed where the model will later see it.
+
+    Generation and evaluation prompts start with BOS, so the model must see BOS in
+    training at the same kind of position, or every prompt starts out of distribution.
+      - ByteTokenizer: BOS is `;`, the addition record terminator, so the raw text
+        already has it in exactly the right places. Encode as is.
+      - A tokenizer with a dedicated BOS: prepend it to every document. For the
+        addition corpus a document is one `a+b=cc;` record; a text file is one
+        document. BOS tokens are special, so they count zero bytes towards bpb and
+        the bits-per-byte floor is unchanged.
+    """
+    if not has_dedicated_bos(tokenizer):
+        return tokenizer.encode(text)
+    bos = tokenizer.get_bos_token_id()
+    if spec.get("kind") != "addition":
+        return [bos] + tokenizer.encode(text)
+    cache, ids = {}, []
+    for i in range(0, len(text), ADDITION_LINE_LEN):  # only 100 distinct records
+        record = text[i:i + ADDITION_LINE_LEN]
+        if record not in cache:
+            cache[record] = [bos] + tokenizer.encode(record)
+        ids.extend(cache[record])
+    return ids
+
+
 class Dataset:
     """A flat token array plus a random-window batch sampler.
 

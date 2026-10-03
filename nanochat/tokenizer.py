@@ -341,3 +341,63 @@ def get_tokenizer():
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
     return RustBPETokenizer.from_directory(tokenizer_dir)
+
+
+# -----------------------------------------------------------------------------
+# Tokenizer provenance
+#
+# A checkpoint's embedding table is meaningless without the exact vocabulary it was
+# trained with, so the training scripts record a small JSON-able spec in meta.json and
+# every downstream script loads the tokenizer from that spec. For BPE, the tokenizer
+# files are *copied* into the run directory: re-running tok_train later must not
+# silently change the vocabulary under an already-trained model.
+
+TOKENIZER_KINDS = ("byte", "bpe")
+
+
+def tokenizer_spec(kind="byte", tokenizer_dir=None):
+    if kind not in TOKENIZER_KINDS:
+        raise ValueError(f"tokenizer kind must be one of {TOKENIZER_KINDS}, got {kind!r}")
+    if kind == "byte":
+        return {"kind": "byte"}
+    if tokenizer_dir is None:
+        from nanochat.common import get_base_dir
+        tokenizer_dir = os.path.join(get_base_dir(), "tokenizer")
+    return {"kind": "bpe", "dir": os.path.abspath(tokenizer_dir)}
+
+
+def load_tokenizer(spec=None):
+    """Build the tokenizer a spec describes. `None` means the byte tokenizer, which is
+    what checkpoints written before specs were recorded used."""
+    spec = spec or {"kind": "byte"}
+    if spec["kind"] == "byte":
+        from nanochat.scratch.data import ByteTokenizer
+        return ByteTokenizer()
+    if spec["kind"] == "bpe":
+        if not os.path.exists(os.path.join(spec["dir"], "tokenizer.pkl")):
+            raise FileNotFoundError(
+                f"no BPE tokenizer in {spec['dir']}. Train one first, e.g.\n"
+                f"    python -m scripts.tok_train --text-file book.txt --vocab-size 512")
+        tokenizer = RustBPETokenizer.from_directory(spec["dir"])
+        expected = spec.get("vocab_size")
+        if expected is not None and tokenizer.get_vocab_size() != expected:
+            raise ValueError(f"tokenizer in {spec['dir']} has vocab "
+                             f"{tokenizer.get_vocab_size()}, the checkpoint expects {expected}")
+        return tokenizer
+    raise ValueError(f"unknown tokenizer kind: {spec['kind']!r}")
+
+
+def snapshot_tokenizer(spec, run_dir):
+    """Copy a BPE tokenizer into `run_dir/tokenizer` and return the spec pointing there.
+
+    Records the vocabulary size too, so a mismatch is caught on load rather than
+    surfacing as an embedding shape error (or, worse, as silently wrong tokens).
+    """
+    if spec["kind"] == "byte":
+        return dict(spec)
+    import shutil
+    dest = os.path.abspath(os.path.join(run_dir, "tokenizer"))
+    if os.path.abspath(spec["dir"]) != dest:
+        shutil.copytree(spec["dir"], dest, dirs_exist_ok=True)
+    vocab_size = RustBPETokenizer.from_directory(dest).get_vocab_size()
+    return {"kind": "bpe", "dir": dest, "vocab_size": vocab_size}

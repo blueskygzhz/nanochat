@@ -15,6 +15,10 @@ derives width, heads and the learning rate from it, so there is one number to tu
 On the default addition corpus, `--holdout-frac` of the operand pairs never appear in
 training. The corpus spec (including that split) is written into every checkpoint,
 so `base_eval` and `chat_sft` evaluate on exactly the pairs this run never saw.
+
+`--tokenizer bpe` uses the tokenizer trained by `scripts.tok_train`. It is copied into
+the run directory and recorded in every checkpoint, so later stages always decode with
+the vocabulary the model was trained on, even if `tok_train` is re-run.
 """
 
 import argparse
@@ -26,10 +30,11 @@ import numpy as np
 
 from nanochat.common import get_base_dir
 from nanochat.scratch import (
-    ByteTokenizer, Dataset, GPT, GPTConfig, build_corpus, corpus_spec, evaluate_bpb,
+    Dataset, GPT, GPTConfig, build_corpus, corpus_spec, encode_corpus, evaluate_bpb,
     find_last_step, load_checkpoint, no_grad, save_checkpoint, setup_optimizer,
     token_bytes_table,
 )
+from nanochat.tokenizer import load_tokenizer, snapshot_tokenizer, tokenizer_spec
 
 
 def parse_args():
@@ -62,6 +67,10 @@ def parse_args():
     p.add_argument("--run", type=str, default="base", help="checkpoint subdirectory name")
     p.add_argument("--resume", action="store_true", help="resume from the last checkpoint")
     # data
+    p.add_argument("--tokenizer", type=str, default="byte", choices=["byte", "bpe"],
+                   help="byte: 256 raw bytes, no training needed. bpe: from scripts.tok_train")
+    p.add_argument("--tokenizer-dir", type=str, default=None,
+                   help="BPE tokenizer location (default: $NANOCHAT_BASE_DIR/tokenizer)")
     p.add_argument("--text-file", type=str, default=None)
     p.add_argument("--corpus-lines", type=int, default=20000)
     p.add_argument("--holdout-frac", type=float, default=0.2,
@@ -117,15 +126,29 @@ def main():
     np.random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
-    tokenizer = ByteTokenizer()
-    spec = corpus_spec(args.text_file, args.corpus_lines, args.seed, args.holdout_frac)
-    text, info = build_corpus(spec)
-    floor = info["floor"]
-    dataset = Dataset.from_text(text, tokenizer)
-    token_bytes = token_bytes_table(tokenizer)
-
     out_dir = os.path.join(get_base_dir(), "checkpoints", args.run)
     os.makedirs(out_dir, exist_ok=True)
+    spec = corpus_spec(args.text_file, args.corpus_lines, args.seed, args.holdout_frac)
+
+    # On resume, the checkpoint's own tokenizer snapshot wins: the vocabulary must not
+    # change underneath a partially trained model.
+    resume_step = find_last_step(out_dir) if args.resume else None
+    if args.resume and resume_step is None:
+        print(f"--resume: nothing to resume in {out_dir}, starting fresh")
+    if resume_step is not None:
+        from nanochat.scratch import load_meta
+        tok_spec = load_meta(out_dir, resume_step).get("tokenizer") or tokenizer_spec("byte")
+        if tok_spec["kind"] != args.tokenizer:
+            raise SystemExit(f"--resume: checkpoint uses the {tok_spec['kind']} tokenizer, "
+                             f"but --tokenizer {args.tokenizer} was given")
+    else:
+        tok_spec = snapshot_tokenizer(tokenizer_spec(args.tokenizer, args.tokenizer_dir), out_dir)
+    tokenizer = load_tokenizer(tok_spec)
+
+    text, info = build_corpus(spec)
+    floor = info["floor"]
+    dataset = Dataset(encode_corpus(text, tokenizer, spec))
+    token_bytes = token_bytes_table(tokenizer)
 
     config = derive_config(args, tokenizer.get_vocab_size())
     model = GPT(config, seed=args.seed)
@@ -134,32 +157,31 @@ def main():
         matrix_lr=args.matrix_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay)
 
     start_step = 0
-    if args.resume:
-        last = find_last_step(out_dir)
-        if last is None:
-            print(f"--resume: nothing to resume in {out_dir}, starting fresh")
-        else:
-            model, meta = load_checkpoint(out_dir, last, model=model, optimizer=optimizer)
-            # Resuming onto different data would silently produce a model trained on
-            # a mixture that no checkpoint describes, and could leak held-out pairs.
-            if meta.get("data") not in (None, spec):
-                raise SystemExit(f"--resume: checkpoint was trained on {meta['data']}, "
-                                 f"but this run is configured for {spec}")
-            start_step = meta["step"] + 1
-            print(f"resumed from step {meta['step']} (val bpb {meta.get('val_bpb', float('nan')):.4f})")
+    if resume_step is not None:
+        model, meta = load_checkpoint(out_dir, resume_step, model=model, optimizer=optimizer)
+        # Resuming onto different data would silently produce a model trained on
+        # a mixture that no checkpoint describes, and could leak held-out pairs.
+        if meta.get("data") not in (None, spec):
+            raise SystemExit(f"--resume: checkpoint was trained on {meta['data']}, "
+                             f"but this run is configured for {spec}")
+        start_step = meta["step"] + 1
+        print(f"resumed from step {meta['step']} (val bpb {meta.get('val_bpb', float('nan')):.4f})")
 
     base_lrs = [g["lr"] for g in optimizer.param_groups]
     tokens_per_step = args.batch_size * args.sequence_len * args.grad_accum_steps
     kind = "MoE" if args.n_routed_experts > 0 else "dense"
 
     print(f"base_train | {kind} d{config.n_layer} w{config.n_embd} | "
-          f"{model.num_parameters():,} params | vocab {config.vocab_size}")
+          f"{model.num_parameters():,} params | {tok_spec['kind']} tokenizer, "
+          f"vocab {config.vocab_size}")
     print(f"{len(dataset.train):,} train / {len(dataset.val):,} val tokens | "
           f"{tokens_per_step:,} tokens/step x {args.num_iterations} steps")
     if floor is not None:
+        # The floor is per *byte* (BOS is special and counts zero bytes), so it holds
+        # for any tokenizer -- which is exactly why bpb is the metric.
         print(f"task: addition | {len(info['train_pairs'])} train pairs, "
-              f"{len(info['heldout_pairs'])} held out | loss floor {floor:.4f} nats "
-              f"| bpb floor {floor / math.log(2):.4f}")
+              f"{len(info['heldout_pairs'])} held out | floor {floor:.4f} nats/byte "
+              f"= {floor / math.log(2):.4f} bpb")
     print(f"checkpoints -> {out_dir}")
     print("-" * 76)
 
@@ -191,7 +213,7 @@ def main():
                 bpb = eval_bpb(model, dataset, token_bytes, args)
             save_checkpoint(out_dir, step, model, optimizer,
                             meta={"val_bpb": bpb, "train_loss": total, "depth": args.depth,
-                                  "seed": args.seed, "data": spec})
+                                  "seed": args.seed, "data": spec, "tokenizer": tok_spec})
 
     print("-" * 76)
     final = bpb if bpb is not None else eval_bpb(model, dataset, token_bytes, args)

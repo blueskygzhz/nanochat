@@ -29,11 +29,12 @@ and it has no FlashAttention, FP8, bf16, kernel fusion or distributed training.
 """
 
 from nanochat.scratch.checkpoint import (
-    build_model, find_last_step, list_steps, load_checkpoint, load_model, save_checkpoint,
+    build_model, find_last_step, list_steps, load_checkpoint, load_meta, load_model,
+    save_checkpoint,
 )
 from nanochat.scratch.data import (
     ByteTokenizer, Dataset, addition_entropy_floor, addition_pairs, build_corpus,
-    corpus_spec, make_addition_corpus,
+    corpus_spec, encode_corpus, make_addition_corpus,
 )
 from nanochat.scratch.engine import Engine, KVCache, sample_next_token
 from nanochat.scratch.eval import evaluate_bpb, evaluate_task, token_bytes_table
@@ -50,12 +51,12 @@ __all__ = [
     "AdamW", "Muon", "MuonAdamW", "setup_optimizer", "polar_express",
     # data
     "ByteTokenizer", "Dataset", "make_addition_corpus", "addition_entropy_floor",
-    "addition_pairs", "corpus_spec", "build_corpus",
+    "addition_pairs", "corpus_spec", "build_corpus", "encode_corpus",
     # inference
     "Engine", "KVCache", "sample_next_token",
     # evaluation
     "evaluate_bpb", "evaluate_task", "token_bytes_table",
     # checkpoints
-    "save_checkpoint", "load_checkpoint", "build_model", "load_model",
+    "save_checkpoint", "load_checkpoint", "load_meta", "build_model", "load_model",
     "find_last_step", "list_steps",
 ]

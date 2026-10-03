@@ -21,7 +21,7 @@ import numpy as np
 from nanochat.scratch.model import GPT, GPTConfig
 
 __all__ = [
-    "save_checkpoint", "load_checkpoint", "build_model",
+    "save_checkpoint", "load_checkpoint", "load_meta", "build_model",
     "find_last_step", "list_steps", "load_model",
 ]
 
@@ -67,6 +67,19 @@ def save_checkpoint(base_dir, step, model, optimizer=None, meta=None):
     _atomic_write(os.path.join(out, "meta.json"),
                   lambda f: f.write(json.dumps(payload, indent=2).encode()))
     return out
+
+
+def load_meta(base_dir, step):
+    """Just the metadata, without building the model.
+
+    Needed before the model exists: the tokenizer recorded here determines the
+    vocabulary size, and so the shape of the embedding table.
+    """
+    path = os.path.join(checkpoint_dir(base_dir, step), "meta.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no checkpoint at {checkpoint_dir(base_dir, step)}")
+    with open(path, "rb") as f:
+        return json.loads(f.read())
 
 
 def load_checkpoint(base_dir, step, model=None, optimizer=None):

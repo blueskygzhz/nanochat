@@ -28,9 +28,10 @@ import random
 
 from nanochat.common import get_base_dir
 from nanochat.scratch import (
-    ByteTokenizer, Dataset, Engine, build_corpus, corpus_spec, evaluate_bpb, evaluate_task,
+    Dataset, Engine, build_corpus, corpus_spec, encode_corpus, evaluate_bpb, evaluate_task,
     list_steps, load_model, token_bytes_table,
 )
+from nanochat.tokenizer import load_tokenizer
 
 
 def parse_args():
@@ -81,12 +82,17 @@ def addition_mc_items(pairs, seed=0):
 
 
 def greedy_exact_match(engine, tokenizer, pairs):
-    """Decode `a+b=` greedily and compare against the zero-padded sum."""
+    """Decode `a+b=` greedily and compare against the zero-padded sum.
+
+    Generates exactly as many tokens as the answer has under this tokenizer: 3 for
+    bytes (`0`, `7`, `;`), typically 2 for BPE (`07`, `;`).
+    """
     correct = 0
     for a, b in pairs:
+        want = f"{a + b:02d};"
         ids = tokenizer.encode(f"{a}+{b}=", prepend="<|bos|>")
-        got = tokenizer.decode(engine.generate_batch(ids, max_tokens=3, temperature=0.0)[0])
-        correct += got == f"{a + b:02d};"
+        out = engine.generate_batch(ids, max_tokens=len(tokenizer.encode(want)), temperature=0.0)
+        correct += tokenizer.decode(out[0]) == want
     return correct
 
 
@@ -97,16 +103,17 @@ def main():
         raise SystemExit(f"no checkpoints in {checkpoints}; run scripts.base_train first")
 
     model, meta = load_model(checkpoints, args.step)
-    tokenizer = ByteTokenizer()
+    tokenizer = load_tokenizer(meta.get("tokenizer"))
     seq_len = model.config.sequence_len
 
     spec = resolve_corpus(meta, args.text_file)
     text, info = build_corpus(spec)
     floor = info["floor"]
-    dataset = Dataset.from_text(text, tokenizer)
+    dataset = Dataset(encode_corpus(text, tokenizer, spec))
 
     print(f"base_eval | run={args.run} step={meta['step']} | "
-          f"d{model.config.n_layer} w{model.config.n_embd} | {model.num_parameters():,} params")
+          f"d{model.config.n_layer} w{model.config.n_embd} | {model.num_parameters():,} params "
+          f"| {meta.get('tokenizer', {'kind': 'byte'})['kind']} tokenizer")
     print(f"corpus: {spec}")
     print("-" * 76)
 

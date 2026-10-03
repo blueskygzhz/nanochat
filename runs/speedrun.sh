@@ -12,7 +12,11 @@
 #   1. pretrain a base model on next-token prediction, reporting bits-per-byte
 #   2. evaluate it: bpb against the known entropy floor, CORE-style multiple choice
 #   3. finetune it on conversations, training only on assistant tokens
-#   4. talk to it
+#   4. evaluate the chat model: generated answers, multi-turn, pass@k
+#   5. talk to it
+#
+# TOKENIZER=bpe trains a BPE tokenizer on the repo's README first (stage 0) and uses
+# it throughout; the default is the 256-entry byte tokenizer, which needs no training.
 
 set -euo pipefail
 
@@ -39,27 +43,37 @@ echo "NANOCHAT_BASE_DIR=$NANOCHAT_BASE_DIR"
 DEPTH="${DEPTH:-4}"
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-400}"
 SFT_STEPS="${SFT_STEPS:-600}"
+TOKENIZER="${TOKENIZER:-byte}"
 
 banner() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
 
-banner "1/4  Pretrain (depth=$DEPTH, $PRETRAIN_STEPS steps)"
+if [[ "$TOKENIZER" == "bpe" ]]; then
+    banner "0/5  Train a BPE tokenizer"
+    "$PY" -m scripts.tok_train --text-file README.md --vocab-size 512
+fi
+
+banner "1/5  Pretrain (depth=$DEPTH, $PRETRAIN_STEPS steps, $TOKENIZER tokenizer)"
 "$PY" -m scripts.base_train \
     --depth "$DEPTH" \
     --num-iterations "$PRETRAIN_STEPS" \
     --eval-every 100 \
+    --tokenizer "$TOKENIZER" \
     --run base
 
-banner "2/4  Evaluate the base model"
+banner "2/5  Evaluate the base model"
 "$PY" -m scripts.base_eval --run base
 
-banner "3/4  Finetune on conversations ($SFT_STEPS steps)"
+banner "3/5  Finetune on conversations ($SFT_STEPS steps)"
 "$PY" -m scripts.chat_sft \
     --source base \
     --num-iterations "$SFT_STEPS" \
     --eval-every 200 \
     --run sft
 
-banner "4/4  Talk to it"
+banner "4/5  Evaluate the chat model"
+"$PY" -m scripts.chat_eval --run sft
+
+banner "5/5  Talk to it"
 for q in "2+3" "7+8" "9+9"; do
     printf 'You: %-5s Bot: ' "$q"
     "$PY" -m scripts.chat_cli --run sft -p "$q"

@@ -8,9 +8,9 @@ user's turn and the assistant's, but we only want to train on the assistant's to
 training on the user's turn teaches the model to invent user messages. So targets at
 every non-assistant position are set to `-1`, which `cross_entropy` ignores.
 
-`nanochat/tokenizer.py:render_conversation` already returns exactly that mask, so this
-script is mostly packing: fit conversations into fixed-length rows, pad the remainder,
-and mask the padding too.
+`nanochat/chat_format.py` renders conversations and returns exactly that mask, for the
+byte tokenizer and for BPE alike, so this script is mostly packing: fit conversations
+into fixed-length rows, pad the remainder, and mask the padding too.
 
     python -m scripts.chat_sft --source base --run sft
 """
@@ -22,11 +22,11 @@ import time
 
 import numpy as np
 
+from nanochat.chat_format import render_conversation
 from nanochat.common import get_base_dir
-from nanochat.scratch import (
-    ByteTokenizer, Engine, addition_pairs, load_model, no_grad,
-    save_checkpoint, setup_optimizer,
-)
+from nanochat.scratch import Engine, addition_pairs, load_model, no_grad, save_checkpoint, setup_optimizer
+from nanochat.tokenizer import load_tokenizer
+from scripts.chat_eval import chat_exact_match
 
 
 def parse_args():
@@ -58,49 +58,28 @@ def parse_args():
 #
 # Conversations are drawn only from the operand pairs the base model was pretrained
 # on. The held-out pairs stay unseen through both stages, so they remain a clean test.
+#
+# Some conversations have several exchanges. Packing puts many conversations in one
+# row, but each starts with BOS, so without these the model would never see a reply
+# that has to be conditioned on an earlier exchange in the *same* conversation.
 
-def make_conversations(n=400, seed=0, pairs=None):
+def make_conversations(n=400, seed=0, pairs=None, max_turns=3):
     import random
     rng = random.Random(seed)
     pairs = pairs or [(a, b) for a in range(10) for b in range(10)]
     out = []
     for _ in range(n):
-        a, b = rng.choice(pairs)
-        out.append([
-            {"role": "user", "content": f"{a}+{b}"},
-            {"role": "assistant", "content": f"{a + b}"},
-        ])
+        messages = []
+        for _ in range(rng.randint(1, max_turns)):
+            a, b = rng.choice(pairs)
+            messages += [{"role": "user", "content": f"{a}+{b}"},
+                         {"role": "assistant", "content": f"{a + b}"}]
+        out.append(messages)
     return out
-
-
-def render_conversation(tokenizer, conversation):
-    """Token ids plus a 1/0 mask marking which positions to train on.
-
-    `ByteTokenizer` has no chat special tokens, so for it we lay out the turns by hand
-    in the same shape the real tokenizer uses and mask everything but the assistant's
-    reply. With a trained BPE tokenizer this delegates to `render_conversation`, which
-    produces the identical contract.
-    """
-    if hasattr(tokenizer, "render_conversation"):
-        return tokenizer.render_conversation(conversation)
-
-    ids, mask = [tokenizer.get_bos_token_id()], [0]
-    for message in conversation:
-        body = tokenizer.encode(message["content"])
-        if message["role"] == "user":
-            ids += tokenizer.encode("U:") + body + tokenizer.encode("\n")
-            mask += [0] * (len(body) + 3)
-        else:
-            prefix = tokenizer.encode("A:")
-            suffix = tokenizer.encode("\n")
-            ids += prefix + body + suffix
-            mask += [0] * len(prefix) + [1] * len(body) + [1] * len(suffix)
-    return ids, mask
 
 
 def pack_batch(tokenizer, conversations, batch_size, seq_len, rng):
     """Pack conversations into (B, T) rows, masking prompts and padding alike."""
-    pad = tokenizer.get_bos_token_id()
     rows, masks = [], []
     for _ in range(batch_size):
         row, row_mask = [], []
@@ -140,7 +119,8 @@ def main():
 
     model, meta = load_model(src_dir, args.source_step)
     model.train()
-    tokenizer = ByteTokenizer()
+    tok_spec = meta.get("tokenizer") or {"kind": "byte"}
+    tokenizer = load_tokenizer(tok_spec)
     seq_len = model.config.sequence_len
 
     # Inherit the base model's held-out split so SFT never sees those pairs either
@@ -158,7 +138,8 @@ def main():
         matrix_lr=args.matrix_lr, scalar_lr=args.scalar_lr)
     base_lrs = [g["lr"] for g in optimizer.param_groups]
 
-    print(f"chat_sft | from {args.source} step {meta['step']} | {model.num_parameters():,} params")
+    print(f"chat_sft | from {args.source} step {meta['step']} | {model.num_parameters():,} params "
+          f"| {tok_spec['kind']} tokenizer")
     print(f"{len(train_convs)} train / {len(val_convs)} val conversations | "
           f"{args.num_iterations} steps")
     print(f"checkpoints -> {out_dir}")
@@ -182,14 +163,14 @@ def main():
             print(f"step {step:5d} | train {loss.item():.4f} | val {val:.4f} "
                   f"| lr x{scale:.2f} | {time.time() - t0:6.1f}s")
 
+    # The tokenizer spec travels with the model: chat_eval and chat_cli read it from here
     save_checkpoint(out_dir, args.num_iterations - 1, model, optimizer,
                     meta={"source": args.source, "source_step": meta["step"],
-                          "data": spec,
+                          "data": spec, "tokenizer": tok_spec,
                           "val_loss": eval_loss(model, tokenizer, val_convs, args, seq_len)})
     print("-" * 72)
 
-    # Does it answer in the finetuned format -- on pairs it trained on, and on pairs
-    # neither pretraining nor SFT ever showed it?
+    # Quick check: does it answer in the finetuned format, on seen and held-out pairs?
     model.eval()
     engine = Engine(model, tokenizer)
     for name, pairs in (("seen pairs", train_pairs), ("held-out pairs", held_pairs)):
@@ -199,18 +180,7 @@ def main():
         correct = chat_exact_match(engine, tokenizer, pairs)
         print(f"{name:16s}: exact match {correct}/{len(pairs)}")
     print("(only the held-out row measures generalisation)")
-    print(f"next: python -m scripts.chat_cli --run {args.run}")
-
-
-def chat_exact_match(engine, tokenizer, pairs):
-    """Greedy-decode the assistant turn for `a+b` and compare against the sum."""
-    correct = 0
-    for a, b in pairs:
-        ids, _ = render_conversation(tokenizer, [{"role": "user", "content": f"{a}+{b}"}])
-        ids = ids + tokenizer.encode("A:")
-        got = tokenizer.decode(engine.generate_batch(ids, max_tokens=4, temperature=0.0)[0])
-        correct += got.split("\n")[0].strip() == str(a + b)
-    return correct
+    print(f"next: python -m scripts.chat_eval --run {args.run}")
 
 
 if __name__ == "__main__":
