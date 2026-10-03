@@ -9,8 +9,10 @@ For details of how the dataset was prepared, see `repackage_data_reference.py`.
 
 import os
 import argparse
+import shutil
 import time
-import requests
+import urllib.error
+import urllib.request
 import pyarrow.parquet as pq
 from multiprocessing import Pool
 
@@ -99,20 +101,18 @@ def download_single_file(index):
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            # Write to temporary file first
-            temp_path = filepath + f".tmp"
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-                    if chunk:
-                        f.write(chunk)
+            # Standard library only: `requests` is not a dependency of this project
+            # (it only arrives transitively with the optional tiktoken extra).
+            # urlopen raises HTTPError on non-2xx, like raise_for_status().
+            temp_path = filepath + ".tmp"
+            with urllib.request.urlopen(url, timeout=30) as response, open(temp_path, 'wb') as f:
+                shutil.copyfileobj(response, f, length=1024 * 1024)  # 1MB chunks
             # Move temp file to final location
             os.rename(temp_path, filepath)
             print(f"Successfully downloaded {filename}")
             return True
 
-        except (requests.RequestException, IOError) as e:
+        except (urllib.error.URLError, OSError) as e:
             print(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
             # Clean up any partial files
             for path in [filepath + f".tmp", filepath]:

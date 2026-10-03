@@ -9,13 +9,15 @@ an optimizer. It is about 60 lines, and seeing it written out is most of the poi
 of this package.
 """
 
+import functools
 import math
 
 import numpy as np
 
 from nanochat.scratch.tensor import (
-    Tensor, cat, cross_entropy, index_add, masked_fill, no_grad, rms_norm, softmax,
+    Tensor, cat, cross_entropy, index_add, no_grad, rms_norm, softmax,
 )
+from nanochat.scratch.tensor import relu_squared as _relu_squared
 
 __all__ = [
     "Parameter", "Module", "ModuleList", "ModuleDict",
@@ -193,8 +195,8 @@ def norm(x, eps=1e-6):
 
 
 def relu_squared(x):
-    """ReLU squared, the activation nanochat uses in every FFN."""
-    return x.relu().square()
+    """ReLU squared, the activation nanochat uses in every FFN (one fused op)."""
+    return _relu_squared(x)
 
 
 # ----------------------------------------------------------------------------
@@ -215,31 +217,49 @@ def causal_window_mask(q_len, kv_len, window=-1, offset=0):
     return blocked
 
 
+@functools.lru_cache(maxsize=512)
+def _grouped_mask(q_len, kv_len, window, offset, rep):
+    """`causal_window_mask` tiled `rep` times down the rows, cached.
+
+    Every layer of every forward asks for the same few masks, and decoding asks for
+    one per position, so they are built once. Marked read-only because the cached
+    array is shared by every caller.
+    """
+    m = np.tile(causal_window_mask(q_len, kv_len, window, offset), (rep, 1))
+    m.setflags(write=False)
+    return m
+
+
 def attention(q, k, v, window=-1, offset=0):
     """Naive scaled dot-product attention with GQA support.
 
     q is (B, T, H, D) and k/v are (B, S, H_kv, D) -- the same layout nanochat feeds
-    to FlashAttention. This materialises the full (B, H, T, S) score matrix, which is
-    exactly what FlashAttention exists to avoid; at the scale this package runs at,
-    that is a fine trade for being readable.
+    to FlashAttention. This materialises the full score matrix, which is exactly what
+    FlashAttention exists to avoid; at this scale that is a fine trade for being
+    readable. Three things keep it from being wasteful:
+
+      - **GQA without copying K/V.** Query head h reads kv head h // rep, so the rep
+        query heads sharing a kv head are adjacent. Reshaping (B, H, T, D) to
+        (B, H_kv, rep*T, D) stacks them as extra *rows* against one shared K/V: a
+        plain batched matmul, with no expanded copy of K and V in the forward and no
+        sum-over-copies in the backward.
+      - **Scale on q, not on scores.** Same result; touches a (T, D) tensor per head
+        instead of a (T, S) one.
+      - **Mask fused into softmax**, which saves a full-size tensor each way.
     """
     B, T, H, D = q.shape
     S, H_kv = k.shape[1], k.shape[2]
     if H % H_kv:
         raise ValueError(f"n_head {H} must be divisible by n_kv_head {H_kv}")
     rep = H // H_kv
-    if rep > 1:  # GQA: query head h reads kv head h // rep
-        k = k.reshape(B, S, H_kv, 1, D).expand(B, S, H_kv, rep, D).reshape(B, S, H, D)
-        v = v.reshape(B, S, H_kv, 1, D).expand(B, S, H_kv, rep, D).reshape(B, S, H, D)
 
-    q = q.permute(0, 2, 1, 3)  # (B, H, T, D)
-    k = k.permute(0, 2, 1, 3)
+    q = (q * (1.0 / math.sqrt(D))).permute(0, 2, 1, 3).reshape(B, H_kv, rep * T, D)
+    k = k.permute(0, 2, 1, 3)                            # (B, H_kv, S, D)
     v = v.permute(0, 2, 1, 3)
 
-    scores = (q @ k.mT) * (1.0 / math.sqrt(D))          # (B, H, T, S)
-    scores = masked_fill(scores, causal_window_mask(T, S, window, offset), -1e9)
-    y = softmax(scores, axis=-1) @ v                    # (B, H, T, D)
-    return y.permute(0, 2, 1, 3)                        # back to (B, T, H, D)
+    mask = _grouped_mask(T, S, window, offset, rep)      # (rep*T, S)
+    y = softmax(q @ k.mT, axis=-1, mask=mask) @ v        # (B, H_kv, rep*T, D)
+    return y.reshape(B, H, T, D).permute(0, 2, 1, 3)     # back to (B, T, H, D)
 
 
 def apply_rotary_emb(x, cos, sin):

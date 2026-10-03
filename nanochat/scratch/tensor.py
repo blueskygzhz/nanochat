@@ -30,7 +30,7 @@ import numpy as np
 __all__ = [
     "Tensor", "no_grad", "is_grad_enabled", "set_dtype", "get_dtype",
     "tensor", "zeros", "ones", "arange",
-    "cat", "stack", "softmax", "rms_norm", "cross_entropy",
+    "cat", "stack", "softmax", "relu_squared", "rms_norm", "cross_entropy",
     "masked_fill", "topk", "index_add", "where",
 ]
 
@@ -114,13 +114,30 @@ def _unbroadcast(grad, shape):
 
 
 def _accumulate(t, g):
-    """Accumulate gradient `g` into tensor `t` (gradients add across fan-out)."""
+    """Accumulate gradient `g` into tensor `t` (gradients add across fan-out).
+
+    The first write copies instead of zero-filling and then adding: one pass over
+    memory rather than two. It must be a copy, not an alias -- the same `g` is often
+    handed to several parents (e.g. both sides of an add), and `g` may be a read-only
+    broadcast view.
+    """
     if not t.requires_grad:
         return
     g = _unbroadcast(_as_array(g), t.data.shape)
     if t.grad is None:
-        t.grad = np.zeros_like(t.data)
-    t.grad += g
+        t.grad = np.array(g, dtype=_DTYPE, copy=True)
+    else:
+        t.grad += g
+
+
+def _freed_backward(_g):
+    """Stands in for the backward closure of a node whose graph has been released.
+
+    A sentinel rather than None, so a freed interior node is never mistaken for a
+    leaf: that would silently park gradient on it instead of failing loudly.
+    """
+    raise RuntimeError("Trying to backward through the graph a second time. "
+                       "Pass retain_graph=True to the first backward() if you need to.")
 
 
 def _make(data, parents, op, backward):
@@ -188,8 +205,18 @@ class Tensor:
 
     # -- backward pass -------------------------------------------------------
 
-    def backward(self, grad=None):
-        """Backpropagate from this tensor to every leaf that requires grad."""
+    def backward(self, grad=None, retain_graph=False):
+        """Backpropagate from this tensor to every leaf that requires grad.
+
+        Memory, which is what bounds model size here, is managed the way torch does it:
+          - an interior node's gradient is dropped as soon as it has been pushed to its
+            parents, so at most a frontier of gradients is alive at once;
+          - unless `retain_graph=True`, each interior node also drops its parents and
+            its backward closure. The closures are what hold the saved activations, so
+            without this a `loss` still in scope keeps the entire forward pass alive --
+            in a training loop, across the *next* forward too, doubling peak memory.
+        Only leaves (parameters, inputs) keep `.grad`.
+        """
         if grad is None:
             if self.data.size != 1:
                 raise RuntimeError("backward() on a non-scalar requires an explicit grad")
@@ -216,8 +243,14 @@ class Tensor:
 
         _accumulate(self, grad)
         for node in reversed(topo):
-            if node._backward is not None and node.grad is not None:
+            if node._backward is None:
+                continue  # a leaf: its .grad is the result
+            if node.grad is not None:
                 node._backward(node.grad)
+            node.grad = None
+            if not retain_graph:
+                node._backward = _freed_backward
+                node._parents = ()
 
     # -- elementwise binary --------------------------------------------------
 
@@ -237,20 +270,28 @@ class Tensor:
             _accumulate(other, -g)
         return _make(self.data - other.data, (self, other), "sub", backward)
 
+    # The backwards below check `requires_grad` before computing a parent's gradient,
+    # rather than computing it and letting `_accumulate` discard it. Constants such as
+    # the rotary cos/sin tables appear in every layer, so that waste adds up.
+
     def __mul__(self, other):
         other = _wrap(other)
 
         def backward(g):
-            _accumulate(self, g * other.data)
-            _accumulate(other, g * self.data)
+            if self.requires_grad:
+                _accumulate(self, g * other.data)
+            if other.requires_grad:
+                _accumulate(other, g * self.data)
         return _make(self.data * other.data, (self, other), "mul", backward)
 
     def __truediv__(self, other):
         other = _wrap(other)
 
         def backward(g):
-            _accumulate(self, g / other.data)
-            _accumulate(other, -g * self.data / (other.data * other.data))
+            if self.requires_grad:
+                _accumulate(self, g / other.data)
+            if other.requires_grad:
+                _accumulate(other, -g * self.data / (other.data * other.data))
         return _make(self.data / other.data, (self, other), "div", backward)
 
     def __pow__(self, p):
@@ -276,15 +317,37 @@ class Tensor:
         return _wrap(other) / self
 
     def __matmul__(self, other):
-        """Batched matmul. Both operands must be at least 2-D."""
+        """Batched matmul. Both operands must be at least 2-D.
+
+        The common case in a transformer is activations (B, T, K) times a weight
+        (K, N). Done naively, the weight gradient is B separate (K, T) @ (T, N)
+        products followed by a sum over B. Folding the batch into the rows instead
+        makes it a single (K, B*T) @ (B*T, N) GEMM -- the same arithmetic, one BLAS
+        call, and no (B, K, N) temporary.
+        """
         other = _wrap(other)
-        if self.data.ndim < 2 or other.data.ndim < 2:
+        a, b = self.data, other.data
+        if a.ndim < 2 or b.ndim < 2:
             raise NotImplementedError("matmul requires both operands to be >= 2-D")
+        fold = a.ndim > 2 and b.ndim == 2
+        if fold:
+            out = (a.reshape(-1, a.shape[-1]) @ b).reshape(*a.shape[:-1], b.shape[-1])
+        else:
+            out = a @ b
 
         def backward(g):
-            _accumulate(self, g @ np.swapaxes(other.data, -1, -2))
-            _accumulate(other, np.swapaxes(self.data, -1, -2) @ g)
-        return _make(self.data @ other.data, (self, other), "matmul", backward)
+            if fold:
+                g2 = g.reshape(-1, g.shape[-1])
+                if self.requires_grad:
+                    _accumulate(self, (g2 @ b.T).reshape(a.shape))
+                if other.requires_grad:
+                    _accumulate(other, a.reshape(-1, a.shape[-1]).T @ g2)
+                return
+            if self.requires_grad:
+                _accumulate(self, g @ np.swapaxes(b, -1, -2))
+            if other.requires_grad:
+                _accumulate(other, np.swapaxes(a, -1, -2) @ g)
+        return _make(out, (self, other), "matmul", backward)
 
     # -- elementwise unary ---------------------------------------------------
 
@@ -553,15 +616,42 @@ def masked_fill(t, mask, value):
 # of intermediate graph for no reason (rms_norm). The analytic forms below are
 # both stable and much cheaper.
 
-def softmax(t, axis=-1):
-    """p = exp(x - max) / sum(exp(x - max));  dx = p * (g - sum(g*p))"""
+def softmax(t, axis=-1, mask=None):
+    """p = exp(x - max) / sum(exp(x - max));  dx = p * (g - sum(g*p))
+
+    `mask` (boolean, True = blocked, broadcastable to x) fuses attention's
+    `masked_fill(-inf)` into the softmax. Blocked entries get probability exactly 0,
+    and because dx is proportional to p, they also get gradient exactly 0 -- the same
+    result as a separate masked_fill, without materialising and back-propagating
+    through another full-size score tensor. Every row must keep at least one
+    unblocked entry, which a causal mask guarantees (the diagonal).
+    """
+    # One full-size allocation, then everything in place: on attention scores this is
+    # the largest tensor in the model, and the naive chain allocates four of them.
     x = t.data
-    e = np.exp(x - x.max(axis=axis, keepdims=True))
-    p = e / e.sum(axis=axis, keepdims=True)
+    p = np.where(mask, -np.inf, x) if mask is not None else x.copy()
+    p -= p.max(axis=axis, keepdims=True)
+    np.exp(p, out=p)
+    p /= p.sum(axis=axis, keepdims=True)
 
     def backward(g):
-        _accumulate(t, p * (g - (g * p).sum(axis=axis, keepdims=True)))
+        gp = g * p
+        gp -= p * gp.sum(axis=axis, keepdims=True)
+        _accumulate(t, gp)
     return _make(p, (t,), "softmax", backward)
+
+
+def relu_squared(t):
+    """relu(x)^2 in one op. dx = 2 * relu(x) * g.
+
+    Composing `relu().square()` stores two full-size activations and walks the graph
+    twice; this is the FFN's activation, i.e. the widest tensor in the model.
+    """
+    r = np.maximum(t.data, _DTYPE.type(0.0))
+
+    def backward(g):
+        _accumulate(t, (2.0 * g) * r)
+    return _make(r * r, (t,), "relu_squared", backward)
 
 
 def rms_norm(t, eps=1e-6):

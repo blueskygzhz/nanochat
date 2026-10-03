@@ -479,6 +479,45 @@ def test_gradients_accumulate_across_backward_calls():
     assert x.grad is None
 
 
+def test_backward_releases_the_graph_and_interior_grads():
+    """Only leaves keep .grad, and the graph (which holds the saved activations) is
+    dropped, so a `loss` still in scope does not pin the whole forward pass."""
+    x = Tensor(np.ones(3), requires_grad=True)
+    h = x * 2.0
+    loss = (h * h).sum()
+    loss.backward()
+    np.testing.assert_allclose(x.grad, 8.0)
+    assert h.grad is None and loss.grad is None
+    assert h._parents == () and loss._parents == ()
+
+
+def test_second_backward_through_a_released_graph_raises():
+    x = Tensor(np.ones(3), requires_grad=True)
+    loss = (x * 2.0).sum()
+    loss.backward()
+    with pytest.raises(RuntimeError, match="second time"):
+        loss.backward()
+
+
+def test_retain_graph_allows_a_second_backward():
+    x = Tensor(np.ones(3), requires_grad=True)
+    loss = (x * 2.0).sum()
+    loss.backward(retain_graph=True)
+    loss.backward()
+    np.testing.assert_allclose(x.grad, 4.0)
+
+
+def test_first_gradient_write_does_not_alias_between_parents():
+    """`a + b` hands the same incoming gradient to both parents. If the first write
+    aliased it instead of copying, a later accumulation into one would leak into the
+    other."""
+    a = Tensor(np.ones(2), requires_grad=True)
+    b = Tensor(np.ones(2), requires_grad=True)
+    ((a + b) * 1.0 + a * 1.0).sum().backward()
+    np.testing.assert_allclose(a.grad, 2.0)
+    np.testing.assert_allclose(b.grad, 1.0)
+
+
 def test_backward_on_non_scalar_without_grad_raises():
     x = Tensor(np.ones((2, 2)), requires_grad=True)
     with pytest.raises(RuntimeError, match="non-scalar"):
@@ -591,6 +630,30 @@ def test_attention_forward_matches_explicit_reference(window, n_kv_head):
 def test_attention_gradients_match_finite_difference(float64_engine):
     _grad_check(lambda q, k, v: snn.attention(q, k, v, window=2),
                 [(1, 5, 2, 4), (1, 5, 2, 4), (1, 5, 2, 4)], n_probes=12, tol=1e-5)
+
+
+@pytest.mark.parametrize("n_kv_head", [2, 1])
+def test_gqa_attention_gradients_match_finite_difference(float64_engine, n_kv_head):
+    """The grouped path stacks query heads as rows against a shared K/V. K and V must
+    receive the *sum* of the gradients from every query head that reads them."""
+    _grad_check(lambda q, k, v: snn.attention(q, k, v, window=2),
+                [(2, 5, 4, 4), (2, 5, n_kv_head, 4), (2, 5, n_kv_head, 4)],
+                n_probes=12, tol=1e-5)
+
+
+def test_masked_softmax_matches_masked_fill_and_blocks_gradient(float64_engine):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((3, 5))
+    mask = snn.causal_window_mask(3, 5, window=1, offset=2)
+    fused = st.softmax(Tensor(x), axis=-1, mask=mask).data
+    reference = _np_softmax(np.where(mask, -1e9, x), -1)
+    np.testing.assert_allclose(fused, reference, atol=1e-12)
+    assert (fused[mask] == 0).all()
+
+    t = Tensor(x.copy(), requires_grad=True)
+    (st.softmax(t, axis=-1, mask=mask) * Tensor(rng.standard_normal((3, 5)))).sum().backward()
+    assert (t.grad[mask] == 0).all(), "blocked scores must receive exactly zero gradient"
+    _grad_check(lambda a: st.softmax(a, axis=-1, mask=mask), [(3, 5)])
 
 
 def test_attention_is_causal():
