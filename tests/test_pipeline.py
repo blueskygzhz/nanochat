@@ -21,12 +21,13 @@ from nanochat.scratch import (
     sample_next_token, save_checkpoint, setup_optimizer, token_bytes_table,
 )
 from nanochat.scratch import eval as seval
+from nanochat.tokenizer import tokenizer_spec
 
 
 @pytest.fixture
 def tiny_model():
     config = GPTConfig(n_layer=2, n_head=4, n_kv_head=2, n_embd=32,
-                       sequence_len=32, vocab_size=256)
+                       sequence_len=32, vocab_size=ByteTokenizer.vocab_size)
     return GPT(config)
 
 
@@ -43,7 +44,7 @@ class StubModel:
     can make a token the *least* likely. A stub removes that coupling entirely.
     """
 
-    def __init__(self, favoured, vocab_size=256, sequence_len=32, n_layer=2,
+    def __init__(self, favoured, vocab_size=ByteTokenizer.vocab_size, sequence_len=32, n_layer=2,
                  n_kv_head=2, head_dim=8):
         self.favoured = favoured
         self.vocab_size = vocab_size
@@ -257,28 +258,13 @@ def test_engine_generate_streams_token_and_index(tiny_model, tokenizer):
     assert all(isinstance(t, int) for t, _ in events)
 
 
-class ToolTokenizer(ByteTokenizer):
-    """A byte tokenizer that also knows the four tool special tokens.
-
-    They are mapped onto control bytes that never occur in the arithmetic text, which
-    is all the engine needs: it only ever compares ids and decodes the expression.
-    """
-
-    SPECIAL = {"<|bos|>": ord(";"), "<|python_start|>": 1, "<|python_end|>": 2,
-               "<|output_start|>": 3, "<|output_end|>": 4}
-
-    def encode_special(self, name):
-        if name not in self.SPECIAL:
-            raise KeyError(f"Unknown special token: {name}")
-        return self.SPECIAL[name]
-
-
 class ScriptedModel(StubModel):
     """Emits `script[k]` as the argmax on its k-th forward, whatever the input, and
     records every input it is fed. That separates "what the model wanted" from "what
     the engine emitted", which is exactly the distinction forced tokens create."""
 
     def __init__(self, script, **kwargs):
+        kwargs.setdefault("vocab_size", ByteTokenizer.vocab_size)  # bytes + specials
         super().__init__(favoured=0, **kwargs)
         self.script = list(script)
         self.fed = []
@@ -298,8 +284,9 @@ def test_engine_splices_the_calculator_result_into_the_stream():
     """`<|python_start|>2+3<|python_end|>` must be followed by the *tool's* tokens
     `<|output_start|>5<|output_end|>`, overriding whatever the model sampled, and
     those tokens must be fed back through the model so the cache contains them."""
-    tok = ToolTokenizer()
-    S, E, OS, OE = 1, 2, 3, 4
+    tok = ByteTokenizer()
+    S, E, OS, OE = (tok.encode_special(n) for n in
+                    ("<|python_start|>", "<|python_end|>", "<|output_start|>", "<|output_end|>"))
     junk, after = ord("x"), ord("!")
     # what the model *wants* to emit at each step; steps 5..7 are overridden
     script = [S, ord("2"), ord("+"), ord("3"), E, junk, junk, junk, after]
@@ -313,18 +300,21 @@ def test_engine_splices_the_calculator_result_into_the_stream():
 
 
 def test_engine_emits_no_output_block_for_a_refused_expression():
-    tok = ToolTokenizer()
-    S, E = 1, 2
+    tok = ByteTokenizer()
+    S, E = tok.encode_special("<|python_start|>"), tok.encode_special("<|python_end|>")
     script = [S, ord("a"), E, ord("!"), ord("!")]
     out = Engine(ScriptedModel(script), tok).generate_batch(
         tok.encode("ab"), max_tokens=5, temperature=0.0, use_tools=True)[0]
     assert out == [S, ord("a"), E, ord("!"), ord("!")], "refused => keep sampling"
 
 
-def test_engine_tools_require_the_special_tokens(tiny_model, tokenizer):
+def test_engine_tools_require_the_special_tokens(tiny_model):
+    """Only the legacy byte tokenizer lacks them; it cannot express a tool call."""
+    from nanochat.scratch import LegacyByteTokenizer
+    legacy = LegacyByteTokenizer()
     with pytest.raises(ValueError, match="tool special tokens"):
-        Engine(tiny_model, tokenizer).generate_batch(tokenizer.encode("ab"), max_tokens=2,
-                                                     use_tools=True)
+        Engine(tiny_model, legacy).generate_batch(legacy.encode("ab"), max_tokens=2,
+                                                  use_tools=True)
 
 
 def test_use_calculator_evaluates_and_refuses():
@@ -342,9 +332,9 @@ def test_use_calculator_evaluates_and_refuses():
 
 def test_token_bytes_table_zeroes_special_tokens(tokenizer):
     table = token_bytes_table(tokenizer)
-    assert table.shape == (256,)
-    # ByteTokenizer has no special tokens, so every entry is one byte
-    assert (table == 1).all()
+    assert table.shape == (265,)
+    assert (table[:256] == 1).all(), "every byte token is one byte"
+    assert (table[256:] == 0).all(), "special tokens are structure, not text: zero bytes"
 
 
 def test_bpb_of_a_uniform_model_is_log2_vocab(tokenizer):
@@ -361,7 +351,7 @@ def test_bpb_of_a_uniform_model_is_log2_vocab(tokenizer):
 
     dataset = Dataset.from_text(make_addition_corpus(500, seed=0), tokenizer)
     table = token_bytes_table(tokenizer)
-    bpb = evaluate_bpb(Uniform(favoured=0), dataset.sequential_batches(4, 16, "val"),
+    bpb = evaluate_bpb(Uniform(favoured=0, vocab_size=256), dataset.sequential_batches(4, 16, "val"),
                        dataset.num_sequential_batches(4, 16, "val"), table)
     np.testing.assert_allclose(bpb, math.log2(256), rtol=1e-6)
 
@@ -612,26 +602,42 @@ def test_sequential_batches_are_reproducible(tokenizer):
 
 
 def test_byte_tokenizer_satisfies_the_eval_surface(tokenizer):
-    assert tokenizer.get_vocab_size() == 256
-    assert tokenizer.get_special_tokens() == set()
-    assert tokenizer.get_bos_token_id() == tokenizer.encode_special("<|bos|>")
+    from nanochat.tokenizer import SPECIAL_TOKENS
+    assert tokenizer.get_vocab_size() == 256 + len(SPECIAL_TOKENS)
+    assert tokenizer.get_special_tokens() == set(SPECIAL_TOKENS)
+    assert tokenizer.get_bos_token_id() == tokenizer.encode_special("<|bos|>") == 256
     assert tokenizer.encode("ab", prepend="<|bos|>")[0] == tokenizer.get_bos_token_id()
     assert tokenizer.decode_single_token_bytes(65) == b"A"
+    assert tokenizer.decode_single_token_bytes(256) == b"<|bos|>"
     assert tokenizer(["ab", "c"]) == [[97, 98], [99]]
     with pytest.raises(KeyError, match="Unknown special token"):
         tokenizer.encode_special("<|nope|>")
+    with pytest.raises(KeyError, match="unknown token id"):
+        tokenizer.decode([999])
 
 
-def test_byte_tokenizer_bos_is_in_distribution(tokenizer):
-    """BOS must be a byte the model actually sees during training.
+def test_no_text_encodes_to_a_special_token(tokenizer):
+    """The core property: structure cannot be written as text. Not the literal names,
+    not the legacy separators, not any byte sequence."""
+    from nanochat.tokenizer import SPECIAL_TOKENS
+    special = {tokenizer.encode_special(n) for n in SPECIAL_TOKENS}
+    for text in SPECIAL_TOKENS + ["a;b", "\nA:5\n", "".join(map(chr, range(256)))]:
+        assert not special & set(tokenizer.encode(text)), text
+    # ...and the literal name round-trips as text, character for character
+    assert tokenizer.decode(tokenizer.encode("<|assistant_end|>")) == "<|assistant_end|>"
 
-    A 256-byte vocabulary has no spare id, so BOS is `;`, the record terminator in the
-    addition corpus. Prepending it reproduces the real mid-stream context; a byte that
-    never occurs in the data would be out of distribution and hurt generation.
-    """
-    corpus = make_addition_corpus(50, seed=0)
-    assert tokenizer.get_bos_token_id() == ord(";")
-    assert tokenizer.get_bos_token_id() in set(tokenizer.encode(corpus))
+
+def test_legacy_byte_tokenizer_still_loads_old_checkpoints():
+    """Checkpoints written before the specials existed recorded no vocab_size."""
+    from nanochat.scratch import LegacyByteTokenizer
+    from nanochat.tokenizer import load_tokenizer
+    for spec in (None, {"kind": "byte"}, {"kind": "byte", "vocab_size": 256}):
+        legacy = load_tokenizer(spec)
+        assert isinstance(legacy, LegacyByteTokenizer)
+        assert legacy.get_vocab_size() == 256 and legacy.get_bos_token_id() == ord(";")
+    assert isinstance(load_tokenizer({"kind": "byte", "vocab_size": 265}), ByteTokenizer)
+    with pytest.raises(ValueError, match="vocab_size 300"):
+        load_tokenizer({"kind": "byte", "vocab_size": 300})
 
 
 # ----------------------------------------------------------------------------
@@ -719,8 +725,9 @@ def bpe_dir(tmp_path_factory):
 
 def test_tokenizer_spec_round_trips_and_checks_vocab(bpe_dir, tmp_path):
     from nanochat.tokenizer import load_tokenizer, snapshot_tokenizer, tokenizer_spec
-    assert isinstance(load_tokenizer(None), ByteTokenizer), "legacy checkpoints => bytes"
-    assert snapshot_tokenizer(tokenizer_spec("byte"), str(tmp_path)) == {"kind": "byte"}
+    byte_spec = snapshot_tokenizer(tokenizer_spec("byte"), str(tmp_path))
+    assert byte_spec == {"kind": "byte", "vocab_size": 265}
+    assert isinstance(load_tokenizer(byte_spec), ByteTokenizer)
 
     from nanochat.tokenizer import RustBPETokenizer
     vocab = RustBPETokenizer.from_directory(bpe_dir).get_vocab_size()
@@ -753,17 +760,19 @@ def test_encode_corpus_puts_bos_where_prompts_will_have_it(bpe_dir):
     spec = corpus_spec(corpus_lines=50, seed=0, holdout_frac=0.2)
     text, _ = build_corpus(spec)
 
-    # bytes: BOS is ';', already in the text at every record boundary
-    assert encode_corpus(text, ByteTokenizer(), spec) == ByteTokenizer().encode(text)
+    # legacy bytes: BOS is ';', already in the text at every record boundary
+    from nanochat.scratch import LegacyByteTokenizer
+    legacy = LegacyByteTokenizer()
+    assert encode_corpus(text, legacy, spec) == legacy.encode(text)
 
-    # dedicated BOS: one per record, and the record content is unchanged
-    tok = load_tokenizer({"kind": "bpe", "dir": bpe_dir})
-    ids = encode_corpus(text, tok, spec)
-    bos = tok.get_bos_token_id()
-    assert ids.count(bos) == 50 and ids[0] == bos
-    assert tok.decode([t for t in ids if t != bos]) == text
-    # and a free-text corpus is one document
-    assert encode_corpus("hello", tok, {"kind": "text"})[0] == bos
+    # dedicated BOS (bytes and BPE alike): one per record, record content unchanged
+    for tok in (ByteTokenizer(), load_tokenizer({"kind": "bpe", "dir": bpe_dir})):
+        ids = encode_corpus(text, tok, spec)
+        bos = tok.get_bos_token_id()
+        assert ids.count(bos) == 50 and ids[0] == bos
+        assert tok.decode([t for t in ids if t != bos]) == text
+        # and a free-text corpus is one document
+        assert encode_corpus("hello", tok, {"kind": "text"})[0] == bos
 
 
 @pytest.mark.parametrize("kind", ["byte", "bpe"])
@@ -788,14 +797,30 @@ def test_render_prompt_is_the_training_layout_up_to_the_reply(kind, bpe_dir):
     """Inference must present exactly the prefix the model was trained on."""
     from nanochat.chat_format import render_conversation, render_prompt
     from nanochat.tokenizer import load_tokenizer
-    tok = load_tokenizer({"kind": kind, "dir": bpe_dir} if kind == "bpe" else None)
+    tok = load_tokenizer({"kind": kind, "dir": bpe_dir} if kind == "bpe" else tokenizer_spec())
     user = [{"role": "user", "content": "2+3"}]
     full, mask = render_conversation(tok, user + [{"role": "assistant", "content": "5"}])
     prompt = render_prompt(tok, user)
     assert full[:len(prompt)] == prompt
     assert mask[len(prompt)] == 1 and not any(mask[:len(prompt)])
-    with pytest.raises(ValueError, match="end with a user"):
-        render_prompt(tok, user + [{"role": "assistant", "content": "5"}])
+
+
+@pytest.mark.parametrize("kind", ["byte", "bpe", "legacy"])
+def test_prefill_continues_the_assistant_turn(kind, bpe_dir):
+    """A final assistant message is a prefill: the turn stays open after its content,
+    so the prompt is exactly the training layout up to that point."""
+    from nanochat.chat_format import render_conversation, render_prompt
+    from nanochat.tokenizer import load_tokenizer
+    spec = {"bpe": {"kind": "bpe", "dir": bpe_dir}, "byte": tokenizer_spec(), "legacy": None}[kind]
+    tok = load_tokenizer(spec)
+    full, _ = render_conversation(tok, [{"role": "user", "content": "2+3"},
+                                        {"role": "assistant", "content": "5 is the answer"}])
+    prompt = render_prompt(tok, [{"role": "user", "content": "2+3"},
+                                 {"role": "assistant", "content": "5 is"}])
+    assert full[:len(prompt)] == prompt and len(prompt) < len(full)
+    with pytest.raises(ValueError, match="cannot end with whitespace"):
+        render_prompt(tok, [{"role": "user", "content": "2+3"},
+                            {"role": "assistant", "content": "5 is "}])
 
 
 def test_fit_history_drops_whole_exchanges_oldest_first():
@@ -822,16 +847,42 @@ def test_chat_cli_streams_a_reply_and_reports_dropped_history():
     from types import SimpleNamespace
     from scripts.chat_cli import respond
     tok = ByteTokenizer()
-    # full prompt = ";" + "U:1+1\n" + "A:2\n" + "U:2+2\n" + "A:" = 19 tokens, which does
-    # not fit in 20 - 4 (room reserved for the reply); dropping one exchange leaves 9
-    model = ScriptedModel([ord("4"), ord("\n")], sequence_len=20)
+    end = tok.encode_special("<|assistant_end|>")
+    # full prompt = bos, user_start, "1+1", user_end, assistant_start, "2", assistant_end,
+    # user_start, "2+2", user_end, assistant_start = 15 tokens, which does not fit in
+    # 16 - 4 (room reserved for the reply); dropping one exchange leaves 8
+    model = ScriptedModel([ord("4"), ord("\n"), ord("5"), end], sequence_len=16)
     args = SimpleNamespace(max_tokens=4, temperature=0.0, top_k=None, seed=0)
     out = io.StringIO()
     history = [{"role": "user", "content": "1+1"}, {"role": "assistant", "content": "2"},
                {"role": "user", "content": "2+2"}]
     reply, dropped = respond(Engine(model, tok), tok, history, args, out=out)
-    assert reply == "4" and out.getvalue() == "4"
+    # a newline is just text now; only the end-of-turn token ends the reply
+    assert reply == "4\n5" and out.getvalue() == "4\n5"
     assert dropped == 2, "the oldest exchange (user + assistant) must be dropped"
+
+
+def test_chat_cli_never_prints_structure_and_returns_parsed_parts():
+    """A tool call in a reply is structure: not printed, but kept in the returned
+    content so the history re-renders it as a tool call, not as literal text."""
+    import io
+    from types import SimpleNamespace
+    from nanochat.chat_format import render_conversation
+    from scripts.chat_cli import respond
+    tok = ByteTokenizer()
+    sp = tok.encode_special
+    script = [ord("a"), sp("<|python_start|>"), ord("1"), sp("<|python_end|>"), ord("b"),
+              sp("<|assistant_end|>")]
+    out = io.StringIO()
+    reply, _ = respond(Engine(ScriptedModel(script, sequence_len=32), tok), tok,
+                       [{"role": "user", "content": "x"}],
+                       SimpleNamespace(max_tokens=8, temperature=0.0, top_k=None, seed=0), out=out)
+    assert out.getvalue() == "a1b", "no '<|python_start|>' text on screen"
+    assert reply == [{"type": "text", "text": "a"}, {"type": "python", "text": "1"},
+                     {"type": "text", "text": "b"}]
+    ids, _ = render_conversation(tok, [{"role": "user", "content": "x"},
+                                       {"role": "assistant", "content": reply}])
+    assert ids[-len(script):] == script, "the history re-renders to exactly what was generated"
 
 
 def test_no_module_imports_requests():
@@ -902,9 +953,11 @@ def test_train_eval_checkpoint_resume_pipeline(tmp_path, tokenizer):
 def test_trained_model_beats_chance_on_the_task_and_generates_correctly(tokenizer):
     """The payoff: after training, CORE-style accuracy is high and greedy decoding
     through the KV-cache engine produces the right digits."""
-    dataset = Dataset.from_text(make_addition_corpus(20000, seed=0), tokenizer)
+    from nanochat.scratch import encode_corpus
+    spec = corpus_spec(corpus_lines=20000, seed=0, holdout_frac=0.0)
+    dataset = Dataset(encode_corpus(build_corpus(spec)[0], tokenizer, spec))  # BOS per record
     config = GPTConfig(n_layer=4, n_head=4, n_kv_head=2, n_embd=64,
-                       sequence_len=64, vocab_size=256)
+                       sequence_len=64, vocab_size=tokenizer.get_vocab_size())
     model = GPT(config)
     opt = setup_optimizer(model, matrix_lr=0.03, embedding_lr=0.2,
                           unembedding_lr=0.02, scalar_lr=0.05)

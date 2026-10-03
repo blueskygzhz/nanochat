@@ -27,7 +27,7 @@ It also checks the chat machinery itself, independent of how good the model is:
 import argparse
 import os
 
-from nanochat.chat_format import render_prompt, reply_stop_tokens
+from nanochat.chat_format import parse_reply, render_prompt, reply_stop_tokens, reply_text
 from nanochat.common import get_base_dir
 from nanochat.scratch import Engine, addition_pairs, list_steps, load_model
 from nanochat.tokenizer import load_tokenizer
@@ -54,7 +54,7 @@ def reply(engine, tokenizer, messages, max_tokens=8, **kwargs):
     stop = set(reply_stop_tokens(tokenizer))
     kwargs.setdefault("temperature", 0.0)
     outs = engine.generate_batch(ids, max_tokens=max_tokens, stop_tokens=sorted(stop), **kwargs)
-    return [tokenizer.decode([t for t in out if t not in stop]).strip() for out in outs]
+    return [reply_text(parse_reply(tokenizer, out)[0]).strip() for out in outs]
 
 
 def chat_exact_match(engine, tokenizer, pairs, history=()):

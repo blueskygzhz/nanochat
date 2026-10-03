@@ -22,7 +22,7 @@ class Prefers:
     def __init__(self, token, second=None, sequence_len=64):
         self.token, self.second = token, second
         self.config = GPTConfig(n_layer=1, n_head=2, n_kv_head=1, n_embd=32,
-                                sequence_len=sequence_len, vocab_size=256)
+                                sequence_len=sequence_len, vocab_size=ByteTokenizer.vocab_size)
         self.seen_lengths = []
 
         class _W:
@@ -33,7 +33,7 @@ class Prefers:
         idx = np.asarray(idx)
         B, T = idx.shape
         self.seen_lengths.append(T)
-        logits = np.zeros((B, T, 256), dtype=np.float32)
+        logits = np.zeros((B, T, ByteTokenizer.vocab_size), dtype=np.float32)
         logits[..., self.token] = 10.0
         if self.second is not None:
             logits[..., self.second] = 5.0
@@ -103,14 +103,15 @@ def test_crop_prompt_keeps_bos_and_the_tail():
 
 def test_generative_scores_with_the_tasks_own_answer_extraction(monkeypatch):
     """GSM8K's evaluate looks for '#### <number>'. A model that emits '#### 7' and
-    then ends its turn is right exactly on the problems whose answer is 7."""
+    then ends its turn (the end-of-turn token, not a newline) is right exactly on the
+    problems whose answer is 7."""
     import tasks.gsm8k
     rows = [{"question": "q", "answer": "work <<3+4=7>>7\n#### 7"},
             {"question": "q", "answer": "work\n#### 8"}]
     _fake_hub(monkeypatch, tasks.gsm8k, rows)
     task = tasks.gsm8k.GSM8K("main", "test")
 
-    reply = [ord(c) for c in "#### 7"] + [ord("\n")]
+    reply = [ord(c) for c in "#### 7"] + [ByteTokenizer().encode_special("<|assistant_end|>")]
 
     class Scripted(Prefers):
         def __call__(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):

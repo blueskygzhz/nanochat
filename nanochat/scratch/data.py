@@ -24,38 +24,105 @@ import os
 
 import numpy as np
 
+from nanochat.tokenizer import SPECIAL_TOKENS
+
 __all__ = [
-    "ByteTokenizer", "make_addition_corpus", "addition_entropy_floor", "addition_pairs",
-    "corpus_spec", "build_corpus", "Dataset",
+    "ByteTokenizer", "LegacyByteTokenizer", "make_addition_corpus", "addition_entropy_floor",
+    "addition_pairs", "corpus_spec", "build_corpus", "Dataset",
 ]
 
 ADDITION_LINE_LEN = 7  # e.g. "7+5=12;"
+N_BYTES = 256
 
 
 class ByteTokenizer:
-    """UTF-8 bytes as tokens. Vocabulary is exactly 256, no training required.
+    """UTF-8 bytes as tokens, plus reserved special tokens. No training required.
 
-    This is the degenerate case of the BPE tokenizer in `nanochat/bpe.py`: no merges,
-    one token per byte. It keeps this package free of any tokenizer dependency.
+    ids 0..255 are the raw bytes; ids 256..264 are `SPECIAL_TOKENS` (BOS, the chat turn
+    markers, the tool-call markers), in that order -- the same names the BPE tokenizer
+    uses, so the chat format and the engine treat both tokenizers identically.
 
-    It also implements the small slice of the `RustBPETokenizer` surface that
-    `nanochat.scratch.eval` and `nanochat.scratch.engine` call, so they can be
-    exercised without training a real tokenizer first.
+    **Structure cannot be written as text.** `encode` maps a string to its UTF-8 bytes
+    and nothing else, so every id it can produce is < 256: no input -- including the
+    literal characters "<|assistant_end|>" -- encodes to a special id. Special ids only
+    enter a sequence when code asks for one by name (`encode_special`, `prepend=`,
+    the chat renderer). That is the property that makes a user message unable to
+    forge a turn boundary. `decode` renders a special id as its name, like tiktoken,
+    which is for debugging only; the chat layer never turns special ids into text.
 
-    **On BOS.** A 256-entry byte vocabulary has no spare id for a real special token,
-    so BOS has to be an actual byte. The choice matters more than it looks: prepending
-    a byte the model never saw during training puts it immediately out of distribution
-    and measurably degrades generation (on the addition task, greedy accuracy drops
-    from 99/100 to 83/100 with a NUL byte as BOS). So BOS is `;`, which terminates
-    every record in the addition corpus and is therefore exactly the context the model
-    sees before a fresh problem mid-stream. `get_special_tokens()` is empty, so `;`
-    still counts toward bits-per-byte like any other byte.
+    This is the degenerate case of the BPE tokenizer in `nanochat/bpe.py` (no merges),
+    and implements the slice of the `RustBPETokenizer` surface the rest of the code
+    calls, so everything runs without training a tokenizer first.
     """
 
-    vocab_size = 256
+    vocab_size = N_BYTES + len(SPECIAL_TOKENS)
+    BOS_ID = N_BYTES + SPECIAL_TOKENS.index("<|bos|>")
+
+    def __init__(self):
+        self._special_ids = {name: N_BYTES + i for i, name in enumerate(SPECIAL_TOKENS)}
+        self._special_names = {i: name for name, i in self._special_ids.items()}
+
+    def encode(self, text, prepend=None, append=None):
+        if isinstance(text, list):
+            return [self.encode(t, prepend=prepend, append=append) for t in text]
+        ids = list(text.encode("utf-8"))
+        if prepend is not None:
+            ids = [prepend if isinstance(prepend, int) else self.encode_special(prepend)] + ids
+        if append is not None:
+            ids = ids + [append if isinstance(append, int) else self.encode_special(append)]
+        return ids
+
+    def __call__(self, texts, **kwargs):
+        return [self.encode(t, **kwargs) for t in texts]
+
+    def decode_single_token_bytes(self, token_id):
+        token_id = int(token_id)
+        if 0 <= token_id < N_BYTES:
+            return bytes([token_id])
+        name = self._special_names.get(token_id)
+        if name is None:
+            raise KeyError(f"unknown token id: {token_id}")
+        return name.encode("utf-8")
+
+    def decode(self, tokens):
+        tokens = [int(t) for t in tokens]
+        if all(0 <= t < N_BYTES for t in tokens):   # the common case, no specials
+            return bytes(tokens).decode("utf-8", errors="replace")
+        return b"".join(map(self.decode_single_token_bytes, tokens)).decode("utf-8", errors="replace")
+
+    def encode_special(self, name):
+        try:
+            return self._special_ids[name]
+        except KeyError:
+            raise KeyError(f"Unknown special token: {name!r}") from None
+
+    def get_bos_token_id(self):
+        return self.BOS_ID
+
+    def get_special_tokens(self):
+        return set(SPECIAL_TOKENS)
+
+    def get_vocab_size(self):
+        return self.vocab_size
+
+
+class LegacyByteTokenizer:
+    """The original 256-id byte tokenizer, kept only to load checkpoints trained with it.
+
+    With no spare ids it has no special tokens, so BOS is the byte `;` (the addition
+    record terminator) and chat turns can only be written as text (`U:` / `A:` /
+    newline). Both are forgeable by input text -- a `;` in a document *is* a document
+    boundary, a "\\nA:" in a user message *is* a fake assistant turn. That is why it was
+    replaced; see `ByteTokenizer`. Checkpoints record which one they were trained with
+    (`nanochat.tokenizer.tokenizer_spec`), so old runs still load and decode correctly.
+    """
+
+    vocab_size = N_BYTES
     BOS_ID = ord(";")
 
     def encode(self, text, prepend=None, append=None):
+        if isinstance(text, list):
+            return [self.encode(t, prepend=prepend, append=append) for t in text]
         ids = list(text.encode("utf-8"))
         if prepend is not None:
             ids = [self.encode_special(prepend)] + ids
@@ -67,14 +134,14 @@ class ByteTokenizer:
         return [self.encode(t, **kwargs) for t in texts]
 
     def decode(self, tokens):
-        return bytes(int(t) & 0xFF for t in tokens).decode("utf-8", errors="replace")
+        return bytes(int(t) for t in tokens).decode("utf-8", errors="replace")
 
     def decode_single_token_bytes(self, token_id):
-        return bytes([int(token_id) & 0xFF])
+        return bytes([int(token_id)])
 
     def encode_special(self, name):
         if name != "<|bos|>":
-            raise KeyError(f"Unknown special token: {name}")
+            raise KeyError(f"Unknown special token: {name!r}")
         return self.BOS_ID
 
     def get_bos_token_id(self):
@@ -165,7 +232,7 @@ def build_corpus(spec):
 
 
 def has_dedicated_bos(tokenizer):
-    """True if BOS is a special token rather than an ordinary byte (as in ByteTokenizer)."""
+    """True if BOS is a special token rather than an ordinary byte (LegacyByteTokenizer)."""
     return "<|bos|>" in tokenizer.get_special_tokens()
 
 
@@ -174,12 +241,12 @@ def encode_corpus(text, tokenizer, spec):
 
     Generation and evaluation prompts start with BOS, so the model must see BOS in
     training at the same kind of position, or every prompt starts out of distribution.
-      - ByteTokenizer: BOS is `;`, the addition record terminator, so the raw text
-        already has it in exactly the right places. Encode as is.
-      - A tokenizer with a dedicated BOS: prepend it to every document. For the
-        addition corpus a document is one `a+b=cc;` record; a text file is one
-        document. BOS tokens are special, so they count zero bytes towards bpb and
+      - A tokenizer with a dedicated BOS (ByteTokenizer, BPE): prepend it to every
+        document. For the addition corpus a document is one `a+b=cc;` record; a text
+        file is one document. BOS is special, so it counts zero bytes towards bpb and
         the bits-per-byte floor is unchanged.
+      - LegacyByteTokenizer: BOS is the byte `;`, the addition record terminator, so
+        the raw text already has it in exactly the right places. Encode as is.
     """
     if not has_dedicated_bos(tokenizer):
         return tokenizer.encode(text)

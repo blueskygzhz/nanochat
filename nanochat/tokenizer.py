@@ -215,7 +215,16 @@ class RustBPETokenizer:
         Returns:
         - ids: list[int] is a list of token ids of this rendered conversation
         - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
+
+        The layout lives in `nanochat/chat_format.py`, shared with the byte tokenizer
+        and with inference, so training and inference cannot drift apart.
         """
+        from nanochat.chat_format import render_conversation
+        return render_conversation(self, conversation["messages"], max_tokens=max_tokens)
+
+    def _render_conversation_upstream(self, conversation, max_tokens=2048):
+        """Upstream's original renderer, kept verbatim as the reference that
+        `tests/test_chat_format.py` checks `chat_format` against."""
         # ids, masks that we will return and a helper function to help build them up.
         ids, mask = [], []
         def add_tokens(token_ids, mask_val):
@@ -359,7 +368,10 @@ def tokenizer_spec(kind="byte", tokenizer_dir=None):
     if kind not in TOKENIZER_KINDS:
         raise ValueError(f"tokenizer kind must be one of {TOKENIZER_KINDS}, got {kind!r}")
     if kind == "byte":
-        return {"kind": "byte"}
+        # vocab_size distinguishes the byte tokenizer with special tokens (265) from the
+        # legacy one (256), whose specs were written without a vocab_size
+        from nanochat.scratch.data import ByteTokenizer
+        return {"kind": "byte", "vocab_size": ByteTokenizer.vocab_size}
     if tokenizer_dir is None:
         from nanochat.common import get_base_dir
         tokenizer_dir = os.path.join(get_base_dir(), "tokenizer")
@@ -367,12 +379,20 @@ def tokenizer_spec(kind="byte", tokenizer_dir=None):
 
 
 def load_tokenizer(spec=None):
-    """Build the tokenizer a spec describes. `None` means the byte tokenizer, which is
-    what checkpoints written before specs were recorded used."""
+    """Build the tokenizer a spec describes.
+
+    `None`, or a byte spec without a vocab_size, means the legacy 256-id byte tokenizer:
+    that is what every checkpoint written before these specs existed was trained with.
+    """
     spec = spec or {"kind": "byte"}
     if spec["kind"] == "byte":
-        from nanochat.scratch.data import ByteTokenizer
-        return ByteTokenizer()
+        from nanochat.scratch.data import ByteTokenizer, LegacyByteTokenizer
+        vocab_size = spec.get("vocab_size")
+        if vocab_size is None or vocab_size == LegacyByteTokenizer.vocab_size:
+            return LegacyByteTokenizer()
+        if vocab_size == ByteTokenizer.vocab_size:
+            return ByteTokenizer()
+        raise ValueError(f"no byte tokenizer has vocab_size {vocab_size}")
     if spec["kind"] == "bpe":
         if not os.path.exists(os.path.join(spec["dir"], "tokenizer.pkl")):
             raise FileNotFoundError(

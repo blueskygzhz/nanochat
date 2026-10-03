@@ -25,7 +25,7 @@ harder task.
 
 import numpy as np
 
-from nanochat.chat_format import render_prompt, reply_stop_tokens
+from nanochat.chat_format import parse_reply, render_prompt, reply_stop_tokens, reply_text
 from nanochat.scratch import no_grad
 
 TASK_NAMES = ("ARC-Easy", "ARC-Challenge", "MMLU", "GSM8K", "HumanEval")
@@ -124,7 +124,7 @@ def run_generative(engine, tokenizer, task, max_problems=None, max_new_tokens=25
         cropped += was_cropped
         out = engine.generate_batch(prompt, max_tokens=new_tokens, temperature=0.0,
                                     stop_tokens=sorted(stop), use_tools=use_tools)[0]
-        completion = tokenizer.decode([t for t in out if t not in stop])
+        completion = reply_text(parse_reply(tokenizer, out)[0])
         correct += bool(task.evaluate(conversation, completion))
     return _result(correct, n, 0.0, cropped)
 

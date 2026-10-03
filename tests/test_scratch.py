@@ -1236,7 +1236,7 @@ def test_byte_tokenizer_round_trips():
     tok = ByteTokenizer()
     for text in ["hello", "7+5=12;", "héllo wörld", ""]:
         assert tok.decode(tok.encode(text)) == text
-    assert tok.vocab_size == 256
+    assert tok.vocab_size == 256 + 9  # bytes + reserved special tokens
 
 
 def test_byte_tokenizer_is_byte_level():

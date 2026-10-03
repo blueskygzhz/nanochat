@@ -19,7 +19,7 @@ import argparse
 import os
 import sys
 
-from nanochat.chat_format import fit_history, reply_stop_tokens
+from nanochat.chat_format import fit_history, parse_reply, reply_stop_tokens, special_ids
 from nanochat.common import get_base_dir
 from nanochat.scratch import Engine, list_steps, load_model
 from nanochat.tokenizer import load_tokenizer
@@ -41,30 +41,36 @@ def parse_args():
 def respond(engine, tokenizer, messages, args, out=sys.stdout):
     """Stream the assistant's reply to `messages` (ending in a user turn) and return it.
 
-    Returns `(reply_text, dropped)` where `dropped` is how many old messages had to be
-    cut to fit the context.
+    Returns `(content, dropped)`. `content` is the reply parsed back into message
+    content (`chat_format.parse_reply`), so it can be appended to the history as is;
+    `dropped` is how many old messages had to be cut to fit the context.
     """
     seq_len = engine.model.config.sequence_len
     max_tokens = min(args.max_tokens, seq_len - 2)
     kept, ids = fit_history(tokenizer, messages, budget=seq_len - max_tokens)
     stop = set(reply_stop_tokens(tokenizer))
+    structural = special_ids(tokenizer)
 
-    pieces, shown = [], ""
+    generated, visible, shown = [], [], ""
     for token, _ in engine.generate(ids, max_tokens=max_tokens, temperature=args.temperature,
                                     top_k=args.top_k, seed=args.seed, stop_tokens=sorted(stop)):
+        generated.append(token)
         if token in stop:
             break
-        pieces.append(token)
+        if token in structural:
+            continue  # structure (e.g. a tool-call marker), never printed as text
+        visible.append(token)
         # Re-decode the whole reply each step and print only the newly resolved text.
         # A byte-level token can be half of a UTF-8 character, so decoding
         # token-by-token would emit replacement characters that later turn out wrong.
-        text = tokenizer.decode(pieces)
+        text = tokenizer.decode(visible)
         if text.endswith("\ufffd"):
             continue  # incomplete character, wait for the next token
         out.write(text[len(shown):])
         out.flush()
         shown = text
-    return tokenizer.decode(pieces), len(messages) - len(kept)
+    content, _ = parse_reply(tokenizer, generated)
+    return content, len(messages) - len(kept)
 
 
 def main():
@@ -111,7 +117,9 @@ def main():
         if dropped:
             history = history[dropped:]
             print(f"(context full: dropped the {dropped // 2} oldest exchange(s))")
-        history.append({"role": "assistant", "content": reply.strip()})
+        # The reply goes back exactly as parsed, so the next turn re-renders it with the
+        # same structure the model produced (no special ids smuggled in as text)
+        history.append({"role": "assistant", "content": reply})
 
 
 if __name__ == "__main__":

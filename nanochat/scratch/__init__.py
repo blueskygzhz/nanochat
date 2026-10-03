@@ -33,8 +33,8 @@ from nanochat.scratch.checkpoint import (
     save_checkpoint,
 )
 from nanochat.scratch.data import (
-    ByteTokenizer, Dataset, addition_entropy_floor, addition_pairs, build_corpus,
-    corpus_spec, encode_corpus, make_addition_corpus,
+    ByteTokenizer, Dataset, LegacyByteTokenizer, addition_entropy_floor, addition_pairs,
+    build_corpus, corpus_spec, encode_corpus, make_addition_corpus,
 )
 from nanochat.scratch.engine import Engine, KVCache, sample_next_token
 from nanochat.scratch.eval import evaluate_bpb, evaluate_task, token_bytes_table

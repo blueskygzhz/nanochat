@@ -12,7 +12,7 @@ bash runs/speedrun.sh   # the full pipeline: pretrain → eval → SFT → chat
 
 ```
 === 1/5  Pretrain ===
-base_train | dense d4 w64 | 229,458 params | byte tokenizer, vocab 256
+base_train | dense d4 w64 | 231,186 params | byte tokenizer, vocab 265
 task: addition | 80 train pairs, 20 held out | floor 0.6260 nats/byte = 0.9031 bpb
 done in 40s | final val bpb 0.9556
 
@@ -107,7 +107,9 @@ Every checkpoint's `meta.json` records the corpus (with its held-out split) and 
 | `nanochat/scratch/optim.py` | `torch.optim`, `nanochat/optim.py` | 226 | AdamW with decoupled decay, and Muon (Polar Express orthogonalization, no SVD) |
 | `nanochat/scratch/data.py` | `nanochat/dataloader.py` | 115 | Byte tokenizer, random batches, sequential evaluation batches, the addition corpus with its known entropy floor |
 | `nanochat/bpe.py` | `rustbpe`, `tiktoken` | 402 | Byte-level BPE: training (merge counting with incremental updates) and inference, standard library only |
-| `nanochat/chat_format.py` | — | 100 | The chat layout shared by SFT and inference (special tokens for BPE, `U:`/`A:` text for bytes), loss masks, history truncation to fit the context |
+| `nanochat/chat_format.py` | — | 250 | The chat layout shared by SFT and inference: message validation, prefill, loss masks, reply parsing into text/tool parts with a stop reason, history truncation |
+
+**Special tokens: structure is never text.** Both tokenizers reserve ids for `SPECIAL_TOKENS` (BOS, turn markers, tool markers) — the byte tokenizer has 256 byte ids plus 9 specials = 265. Text encoding is ordinary-only, so no string, including a literal `<|assistant_end|>`, can produce a special id: a user cannot forge a turn, and a `;` or a newline is just a character. This is the same separation Anthropic made in moving from the Text Completions API (turns written as `\n\nHuman:` / `\n\nAssistant:` text) to the Messages API (structured messages, rendered by the server), and `chat_format` follows the Messages API's documented semantics: roles alternate starting with the user, a final assistant message is a prefill that may not end in whitespace, replies end with an end-of-turn token (a reply may contain newlines) and come back as structured content with a stop reason (`end_turn` / `max_tokens`). Checkpoints trained with the old 256-id byte tokenizer (BOS = `;`, turns as `U:`/`A:` text) still load: their tokenizer spec has no `vocab_size`, which selects `LegacyByteTokenizer`.
 
 **Memory and speed.** Like torch, `backward()` frees each interior gradient as soon as it has been propagated and releases the graph (the closures holding saved activations) unless `retain_graph=True`; a second backward through a freed graph raises instead of silently mis-accumulating. Attention runs GQA as a plain batched matmul (query heads sharing a KV head are stacked as rows, so K/V are never copied), the causal mask is fused into the softmax, and `relu²` is one op. Against the previous version, a d8/T=256 training step uses 63% less peak memory (1770 → 651 MB) and runs 13–15% faster; float64 gradients agree to 4e-9 relative.
 
@@ -196,6 +198,7 @@ NANOCHAT_BPE_BACKEND=rust python -m scripts.tok_train
 └── tests
     ├── test_benchmarks.py          # Benchmark scoring, offline (fake hub data, stub model)
     ├── test_bpe.py                 # BPE training/encoding, rustbpe+tiktoken parity
+    ├── test_chat_format.py         # Chat layout, injection resistance, reply parsing
     ├── test_execution.py           # Sandboxed code execution
     ├── test_pipeline.py            # KV cache, engine, eval, checkpoints, tokenizers, chat
     ├── test_scratch.py             # Autograd, layers, model, optimizers, convergence
