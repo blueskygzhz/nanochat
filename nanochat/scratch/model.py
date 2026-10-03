@@ -1,0 +1,459 @@
+"""
+nanochat's GPT, rebuilt on the from-scratch autograd engine.
+
+This mirrors the architecture in `nanochat/gpt.py` -- RMSNorm everywhere, RoPE with
+QK-norm, GQA, ResFormer value embeddings with a learned gate, embedding smear,
+per-layer residual/x0 scalars, mid-layer backout, ReLU-squared FFNs, DeepSeek-V2
+style MoE with a load-balancing auxiliary loss, and tanh-softcapped logits.
+
+Deliberately *not* mirrored, because they are properties of the GPU stack rather
+than of the model: FlashAttention (we use the naive O(T^2) form), FP8 matmuls,
+bf16 compute, torch.compile, activation checkpointing, MLA, and the MTP head.
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from nanochat.scratch import nn
+from nanochat.scratch.tensor import (
+    Tensor, cat, cross_entropy, get_dtype, index_add, no_grad, softmax, topk,
+)
+
+
+@dataclass
+class GPTConfig:
+    sequence_len: int = 64
+    vocab_size: int = 256
+    n_layer: int = 4
+    n_head: int = 4
+    n_kv_head: int = 2
+    n_embd: int = 64
+    window_pattern: str = "SSSL"
+    # MoE (n_routed_experts <= 0 => every layer is a dense MLP)
+    n_routed_experts: int = 0
+    n_shared_experts: int = 0
+    num_experts_per_tok: int = 2
+    moe_intermediate_mult: float = 0.6875
+    first_k_dense_replace: int = 1
+    moe_layer_freq: int = 1
+    norm_topk_prob: bool = False
+    routed_scaling_factor: float = 1.0
+    aux_loss_alpha: float = 0.001
+    seq_aux: bool = True
+
+    def __post_init__(self):
+        if self.n_embd % self.n_head:
+            raise ValueError("n_embd must be divisible by n_head")
+        if self.n_head % self.n_kv_head:
+            raise ValueError("n_head must be divisible by n_kv_head")
+        if self.n_embd < 24:
+            raise ValueError("n_embd must be >= 24 (the smear gate reads 24 channels)")
+        if (self.n_embd // self.n_head) % 2:
+            raise ValueError("head_dim must be even for rotary embeddings")
+        if not all(c in "SL" for c in self.window_pattern.upper()):
+            raise ValueError("window_pattern may only contain S and L")
+
+    @property
+    def head_dim(self):
+        return self.n_embd // self.n_head
+
+
+def has_ve(layer_idx, n_layer):
+    """Value embeddings on alternating layers; the last layer always gets one."""
+    return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def moe_intermediate_size(config):
+    # The real model rounds up to a multiple of 128 for tensor cores. There are no
+    # tensor cores here, so we round to 8 to keep tiny configs actually tiny.
+    hidden = int(round(config.moe_intermediate_mult * config.n_embd))
+    return max(8, -(-hidden // 8) * 8)
+
+
+def is_moe_layer(layer_idx, config):
+    return (config.n_routed_experts > 0
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0)
+
+
+# ----------------------------------------------------------------------------
+
+class CausalSelfAttention(nn.Module):
+    VE_GATE_CHANNELS = 12
+
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.head_dim = config.head_dim
+        self.c_q = nn.Linear(config.n_embd, config.n_head * self.head_dim)
+        self.c_k = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim)
+        self.c_v = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.ve_gate = (nn.Linear(self.VE_GATE_CHANNELS, config.n_kv_head)
+                        if has_ve(layer_idx, config.n_layer) else None)
+
+    def forward(self, x, ve, cos_sin, window, kv_cache=None):
+        B, T, _ = x.shape
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): blend in the value embedding through a
+        # per-head, input-dependent gate in (0, 3).
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3.0 * self.ve_gate(x[..., :self.VE_GATE_CHANNELS]).sigmoid()
+            v = v + gate.unsqueeze(-1) * ve
+
+        cos, sin = cos_sin
+        q = nn.apply_rotary_emb(q, cos, sin)
+        k = nn.apply_rotary_emb(k, cos, sin)
+        q, k = nn.norm(q) * 1.2, nn.norm(k) * 1.2  # QK norm + sharper attention
+
+        if kv_cache is None:
+            return self.c_proj(nn.attention(q, k, v, window=window).reshape(B, T, -1))
+
+        # Decoding: append this step's K/V to the cache and attend over the whole
+        # prefix. `offset` tells the mask where these queries sit in absolute
+        # position, which is what keeps the causal/window geometry correct.
+        offset = kv_cache.get_pos()
+        k_all, v_all = kv_cache.append(self.layer_idx, k.data, v.data)
+        y = nn.attention(q, Tensor(k_all), Tensor(v_all), window=window, offset=offset)
+        return self.c_proj(y.reshape(B, T, -1))
+
+
+class MLP(nn.Module):
+    """Dense FFN, also the body of every MoE expert."""
+
+    def __init__(self, config, intermediate_size=None):
+        super().__init__()
+        hidden = 4 * config.n_embd if intermediate_size is None else intermediate_size
+        self.c_fc = nn.Linear(config.n_embd, hidden)
+        self.c_proj = nn.Linear(hidden, config.n_embd)
+
+    def forward(self, x):
+        return self.c_proj(nn.relu_squared(self.c_fc(x)))
+
+
+class MoEGate(nn.Module):
+    """The router. Picks top-k experts per token and produces the load-balancing loss.
+
+    Note what is and is not differentiable here: the *indices* are discrete and carry
+    no gradient, the *weights* do. The auxiliary loss is differentiable only through
+    the mean softmax score (`Pi`); the dispatch counts (`fi`) are constants, because
+    they come from scatter-adding ones at the chosen indices.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+        self.norm_topk_prob = config.norm_topk_prob
+        self.routed_scaling_factor = config.routed_scaling_factor
+        if not 1 <= self.top_k <= self.n_routed_experts:
+            raise ValueError("top_k must be in [1, n_routed_experts]")
+        self.weight = nn.Parameter(np.zeros((self.n_routed_experts, config.n_embd)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        flat = x.reshape(B * T, C)
+        scores = softmax(flat @ self.weight.mT, axis=-1)          # (N, E)
+        topk_weight, topk_idx = topk(scores, self.top_k, axis=-1)  # (N, k)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(axis=-1, keepdims=True) + 1e-20)
+        else:
+            topk_weight = topk_weight * self.routed_scaling_factor
+
+        aux_loss = None
+        if self.training and self.alpha > 0.0:
+            E = self.n_routed_experts
+            if self.seq_aux:
+                # Per-sequence balance: dispatch fraction within each sequence, averaged over batch
+                idx_per_seq = topk_idx.reshape(B, T * self.top_k)
+                ce = np.zeros((B, E), dtype=np.float32)
+                np.add.at(ce, (np.arange(B)[:, None], idx_per_seq), 1.0)
+                ce /= (T * self.top_k / E)
+                mean_scores = scores.reshape(B, T, E).mean(axis=1)   # (B, E)
+                aux_loss = (mean_scores * ce).sum(axis=1).mean() * self.alpha
+            else:
+                # Global balance over all tokens: sum_i P_i * f_i
+                assignments = topk_idx.reshape(-1)
+                counts = np.bincount(assignments, minlength=E).astype(np.float32)
+                fi = (counts / assignments.size) * E
+                aux_loss = (scores.mean(axis=0) * fi).sum() * self.alpha
+
+        return topk_idx, topk_weight, aux_loss
+
+
+class MoE(nn.Module):
+    """DeepSeek-V2 style MoE: top-k routed experts plus optional always-on shared experts.
+
+    Like nanochat (and unlike DeepSeek's reference code) the auxiliary loss is stashed
+    on `self.aux_loss` and added to the main loss by `GPT.forward`, rather than being
+    injected through an autograd hack that hard-codes an incoming gradient of 1.0.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_routed_experts = config.n_routed_experts
+        inter = moe_intermediate_size(config)
+        self.experts = nn.ModuleList([MLP(config, inter) for _ in range(self.n_routed_experts)])
+        self.gate = MoEGate(config)
+        self.shared_experts = (MLP(config, inter * config.n_shared_experts)
+                               if config.n_shared_experts > 0 else None)
+        self.aux_loss = None
+
+    def forward(self, x):
+        B, T, C = x.shape
+        topk_idx, topk_weight, self.aux_loss = self.gate(x)
+        y = self._dispatch(x.reshape(B * T, C), topk_idx, topk_weight).view(B, T, C)
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(x)
+        return y
+
+    def _dispatch(self, x_flat, topk_idx, topk_weight):
+        """Sort (token, slot) pairs by expert, run each expert on one contiguous slice,
+        then scatter-add back. Same math as DeepSeek's `moe_infer`.
+
+        The scatter-add is what makes the backward work: a token routed to k experts
+        gathers gradient from all k of its slots, which is precisely the adjoint of
+        `index_add`."""
+        N, k = topk_idx.shape
+        flat_expert = topk_idx.reshape(-1)
+        order = np.argsort(flat_expert, kind="stable")      # group pairs by expert
+        tok_idx = order // k                                # source token of each pair
+        w = topk_weight.reshape(N * k)[order].reshape(N * k, 1)
+        counts = np.bincount(flat_expert, minlength=self.n_routed_experts)
+
+        xs = x_flat[tok_idx]                                # tokens in expert order
+        outs, start = [], 0
+        for e, c in enumerate(counts):
+            if c > 0:
+                outs.append(self.experts[e](xs[start:start + c]))
+                start += c
+        y = cat(outs, axis=0) * w
+        return index_add(x_flat.shape, tok_idx, y)
+
+
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MoE(config) if is_moe_layer(layer_idx, config) else MLP(config)
+
+    def forward(self, x, ve, cos_sin, window, kv_cache=None):
+        x = x + self.attn(nn.norm(x), ve, cos_sin, window, kv_cache)
+        x = x + self.mlp(nn.norm(x))
+        return x
+
+
+# ----------------------------------------------------------------------------
+
+class GPT(nn.Module):
+    SMEAR_GATE_CHANNELS = 24
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.window_sizes = self._compute_window_sizes(config)
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)])
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.resid_lambdas = nn.Parameter(np.ones(config.n_layer))
+        self.x0_lambdas = nn.Parameter(np.zeros(config.n_layer))
+        self.smear_gate = nn.Linear(self.SMEAR_GATE_CHANNELS, 1)
+        self.smear_lambda = nn.Parameter(np.zeros(1))
+        self.backout_lambda = nn.Parameter(0.2 * np.ones(1))
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(config.vocab_size, config.n_kv_head * config.head_dim)
+            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+        })
+        self.cos, self.sin = self._precompute_rotary(config.sequence_len, config.head_dim)
+        self.init_weights()
+
+    # -- setup ---------------------------------------------------------------
+
+    def _compute_window_sizes(self, config):
+        """Per-layer left-window sizes. L = full context, S = quarter context.
+        The pattern tiles across layers and the last layer is always L."""
+        pattern = config.window_pattern.upper()
+        short = max(1, config.sequence_len // 4)
+        sizes = [(-1 if pattern[i % len(pattern)] == "L" else short)
+                 for i in range(config.n_layer)]
+        sizes[-1] = -1
+        return sizes
+
+    def _precompute_rotary(self, seq_len, head_dim, base=100000.0):
+        channels = np.arange(0, head_dim, 2, dtype=np.float32)
+        inv_freq = 1.0 / (base ** (channels / head_dim))
+        freqs = np.outer(np.arange(seq_len, dtype=np.float32), inv_freq)
+        # (1, T, 1, head_dim/2) so they broadcast over batch and heads
+        cos = Tensor(np.cos(freqs)[None, :, None, :])
+        sin = Tensor(np.sin(freqs)[None, :, None, :])
+        return cos, sin
+
+    @no_grad()
+    def init_weights(self):
+        """The whole initialisation scheme in one function, mirroring nanochat.
+
+        The two choices worth noticing: every output projection starts at exactly
+        zero (so each block is an identity map at step 0 and the residual stream is
+        clean), and `resid_lambdas`/`x0_lambdas` decay with depth so early layers
+        lean on the embedding and deep layers lean on the residual.
+        """
+        rng = np.random.default_rng(0)
+        dt = get_dtype()
+        n_embd = self.config.n_embd
+        s = 3 ** 0.5 * n_embd ** -0.5  # sqrt(3) makes Uniform match Normal's std
+
+        self.wte.weight.data = rng.normal(0.0, 0.8, self.wte.weight.shape).astype(dt)
+        self.lm_head.weight.data = rng.normal(0.0, 0.001, self.lm_head.weight.shape).astype(dt)
+
+        for block in self.h:
+            for lin in (block.attn.c_q, block.attn.c_k, block.attn.c_v):
+                lin.weight.data = rng.uniform(-s, s, lin.weight.shape).astype(dt)
+            block.attn.c_proj.weight.data = np.zeros_like(block.attn.c_proj.weight.data)
+            if block.attn.ve_gate is not None:
+                block.attn.ve_gate.weight.data = rng.uniform(
+                    0.0, 0.02, block.attn.ve_gate.weight.shape).astype(dt)
+
+            if isinstance(block.mlp, MoE):
+                experts = list(block.mlp.experts)
+                if block.mlp.shared_experts is not None:
+                    experts.append(block.mlp.shared_experts)
+                for expert in experts:
+                    expert.c_fc.weight.data = rng.uniform(
+                        -s * 0.4, s * 0.4, expert.c_fc.weight.shape).astype(dt)
+                    expert.c_proj.weight.data = np.zeros_like(expert.c_proj.weight.data)
+                # Router bound = 1/sqrt(fan_in), i.e. DeepSeek's kaiming_uniform_(a=sqrt(5))
+                block.mlp.gate.weight.data = rng.uniform(
+                    -n_embd ** -0.5, n_embd ** -0.5, block.mlp.gate.weight.shape).astype(dt)
+            else:
+                block.mlp.c_fc.weight.data = rng.uniform(
+                    -s * 0.4, s * 0.4, block.mlp.c_fc.weight.shape).astype(dt)
+                block.mlp.c_proj.weight.data = np.zeros_like(block.mlp.c_proj.weight.data)
+
+        n_layer = self.config.n_layer
+        denom = max(n_layer - 1, 1)
+        self.resid_lambdas.data = np.array(
+            [1.15 - 0.10 * i / denom for i in range(n_layer)], dtype=dt)
+        self.x0_lambdas.data = np.array(
+            [0.20 - 0.15 * i / denom for i in range(n_layer)], dtype=dt)
+        self.smear_lambda.data = np.zeros(1, dtype=dt)
+        self.backout_lambda.data = np.full(1, 0.2, dtype=dt)
+        self.smear_gate.weight.data = rng.uniform(
+            0.0, 0.02, self.smear_gate.weight.shape).astype(dt)
+        for ve in self.value_embeds.values():
+            ve.weight.data = rng.uniform(-s, s, ve.weight.shape).astype(dt)
+
+    # -- forward -------------------------------------------------------------
+
+    def embed_tokens(self, idx):
+        return nn.norm(self.wte(idx))
+
+    def forward_hidden(self, idx, kv_cache=None):
+        idx = np.asarray(idx, dtype=np.int64)
+        B, T = idx.shape
+        # With a cache, the rotary tables must cover the absolute positions T0..T0+T
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        if T0 + T > self.config.sequence_len:
+            raise ValueError(
+                f"sequence length {T0 + T} exceeds rotary cache {self.config.sequence_len}")
+        if kv_cache is None and T < 2:
+            raise ValueError("forward needs T >= 2 (the smear reads the previous token)")
+        cos_sin = (self.cos[:, T0:T0 + T], self.sin[:, T0:T0 + T])
+
+        x = self.embed_tokens(idx)
+        # Smear: mix the previous token's embedding in, gated. Cheap bigram information.
+        # The pre-smear embedding of the last token is cache state: at the next decode
+        # step there is no in-batch predecessor to read, so it has to be carried over.
+        if kv_cache is None:
+            gate = self.smear_lambda * self.smear_gate(x[:, 1:, :self.SMEAR_GATE_CHANNELS]).sigmoid()
+            x = cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1)
+        else:
+            prev = kv_cache.prev_embedding
+            kv_cache.prev_embedding = x[:, -1:, :].data.copy()
+            if T > 1:
+                gate = self.smear_lambda * self.smear_gate(x[:, 1:, :self.SMEAR_GATE_CHANNELS]).sigmoid()
+                first = x[:, :1]
+                if prev is not None:
+                    first_gate = self.smear_lambda * self.smear_gate(
+                        first[:, :, :self.SMEAR_GATE_CHANNELS]).sigmoid()
+                    first = first + first_gate * Tensor(prev)
+                x = cat([first, x[:, 1:] + gate * x[:, :-1]], axis=1)
+            elif prev is not None:
+                gate = self.smear_lambda * self.smear_gate(x[:, :, :self.SMEAR_GATE_CHANNELS]).sigmoid()
+                x = x + gate * Tensor(prev)
+
+        x0 = x
+        backout_layer = self.config.n_layer // 2
+        x_backout = None
+        for i, block in enumerate(self.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if i == backout_layer:
+                x_backout = x
+        if x_backout is not None:
+            x = x - self.backout_lambda * x_backout
+        if kv_cache is not None:
+            kv_cache.advance(T)
+        return nn.norm(x)
+
+    def logits(self, hidden):
+        """Softcap the logits with 15*tanh(z/15): keeps them in a sane range without
+        a hard clip, which matters because the head starts at ~zero init."""
+        return 15.0 * (self.lm_head(hidden) / 15.0).tanh()
+
+    def collect_aux_loss(self):
+        """Sum of the MoE load-balancing losses from the most recent forward."""
+        total = None
+        for m in self.modules():
+            if isinstance(m, MoE) and m.aux_loss is not None:
+                total = m.aux_loss if total is None else total + m.aux_loss
+        return total
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
+        hidden = self.forward_hidden(idx, kv_cache)
+        logits = self.logits(hidden)
+        if targets is None:
+            return logits
+        B, T, V = logits.shape
+        loss = cross_entropy(logits.reshape(B * T, V), np.asarray(targets).reshape(-1),
+                             ignore_index=-1, reduction=loss_reduction)
+        if loss_reduction == "none":
+            loss = loss.reshape(B, T)  # (B, T) per-token losses, for bits-per-byte
+        aux = self.collect_aux_loss()
+        if aux is not None and loss_reduction == "mean":
+            loss = loss + aux
+        return loss
+
+    # -- inference -----------------------------------------------------------
+
+    @no_grad()
+    def generate(self, prompt, max_tokens, temperature=1.0, top_k=None, seed=0):
+        """Plain autoregressive sampling. No KV cache: every step re-runs the whole
+        prefix, which is O(n^2) total but keeps the code honest and short."""
+        rng = np.random.default_rng(seed)
+        tokens = list(prompt)
+        for _ in range(max_tokens):
+            window = tokens[-self.config.sequence_len:]
+            logits = self.forward(np.array([window], dtype=np.int64)).data[0, -1]
+            if temperature == 0.0:
+                nxt = int(np.argmax(logits))
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    kth = np.partition(logits, -top_k)[-top_k]
+                    logits = np.where(logits < kth, -np.inf, logits)
+                p = np.exp(logits.astype(np.float64) - logits.max())
+                p /= p.sum()
+                nxt = int(rng.choice(len(p), p=p))
+            tokens.append(nxt)
+        return tokens

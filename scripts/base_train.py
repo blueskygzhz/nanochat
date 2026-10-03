@@ -1,738 +1,194 @@
 """
-Train model. From root directory of the project, run as:
+Pretrain a base model: `python -m scripts.base_train`
 
-python -m scripts.base_train
+The from-scratch counterpart of nanochat's `scripts/base_train.py`. Same pipeline
+shape -- warmup/cosine schedule, gradient accumulation, periodic held-out evaluation
+in bits-per-byte, checkpointing, and resume -- at a scale that finishes on a CPU.
 
-or distributed as:
+    python -m scripts.base_train --depth 4 --num-iterations 400
+    python -m scripts.base_train --resume                      # continue from the last step
+    python -m scripts.base_train --text-file book.txt          # your own corpus
 
-torchrun --nproc_per_node=8 -m scripts.base_train
-
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+`--depth` is the single complexity dial, as upstream: it sets the number of layers and
+derives width, heads and the learning rate from it, so there is one number to turn.
 """
 
-import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-import gc
-import json
-import time
-import math
 import argparse
-from dataclasses import asdict
-from contextlib import contextmanager
+import math
+import os
+import time
 
-import wandb
-import torch
-import torch.distributed as dist
+import numpy as np
 
-from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
-from scripts.base_eval import evaluate_core
-print_banner()
-
-# -----------------------------------------------------------------------------
-# CLI arguments
-parser = argparse.ArgumentParser(description="Pretrain base model")
-# Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
-# Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
-# FP8 training
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
-parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["tensorwise"], help="FP8 scaling recipe supported by the local implementation")
-# Model architecture
-parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
-parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
-parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--n-kv-head", type=int, default=-1, help="number of KV heads for GQA (-1 = same as query heads, i.e. MHA)")
-parser.add_argument("--attention-type", choices=["gqa", "mla"], default="gqa", help="attention architecture; MLA uses compressed latent KV cache")
-parser.add_argument("--q-lora-rank", type=int, default=0, help="MLA query compression rank (0 = direct query projection)")
-parser.add_argument("--kv-lora-rank", type=int, default=512, help="MLA joint KV compression rank")
-parser.add_argument("--qk-nope-head-dim", type=int, default=128, help="MLA non-rotary Q/K dimension per head")
-parser.add_argument("--qk-rope-head-dim", type=int, default=64, help="MLA decoupled rotary Q/K dimension (must be even)")
-parser.add_argument("--v-head-dim", type=int, default=128, help="MLA value dimension per head")
-parser.add_argument("--mtp", action="store_true", help="train a lightweight one-step token-conditioned MTP draft head")
-parser.add_argument("--mtp-loss-weight", type=float, default=0.1, help="weight of the auxiliary next-next-token loss")
-parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to save activation memory (needed for ~7B)")
-parser.add_argument("--loss-chunk-size", type=int, default=0, help="tokens per checkpointed LM-head/loss chunk (0 = unchunked)")
-parser.add_argument("--muon-bucket-mb", type=int, default=0, help="Muon bucket target in MiB; >0 enables sequential low-memory updates (changes optimizer groups)")
-parser.add_argument("--no-compile", action="store_true", help="disable model compilation for debugging and smoke tests")
-parser.add_argument("--dry-run", action="store_true", help="print model parameter/FLOP counts on meta device without loading data or allocating weights")
-parser.add_argument("--vocab-size", type=int, default=32768, help="vocabulary size used only by --dry-run; real training uses its tokenizer")
-parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
-# Mixture-of-Experts (DeepSeek-V2 style). n-routed-experts=0 => dense model (default)
-parser.add_argument("--n-routed-experts", type=int, default=0, help="routed experts per MoE layer (0 = dense model)")
-parser.add_argument("--n-shared-experts", type=int, default=0, help="always-on shared experts per MoE layer (0 = disabled)")
-parser.add_argument("--num-experts-per-tok", type=int, default=6, help="top-k routed experts per token")
-parser.add_argument("--moe-intermediate-mult", type=float, default=0.6875, help="expert FFN hidden = mult * n_embd")
-parser.add_argument("--first-k-dense-replace", type=int, default=1, help="keep the first K layers dense")
-parser.add_argument("--moe-layer-freq", type=int, default=1, help="of the remaining layers, every Nth is MoE")
-parser.add_argument("--topk-method", type=str, default="greedy", choices=["greedy", "group_limited_greedy"], help="expert selection method")
-parser.add_argument("--n-group", type=int, default=1, help="expert groups for group_limited_greedy")
-parser.add_argument("--topk-group", type=int, default=1, help="groups kept per token for group_limited_greedy")
-parser.add_argument("--norm-topk-prob", action="store_true", help="renormalize top-k gate weights to sum to 1")
-parser.add_argument("--routed-scaling-factor", type=float, default=1.0, help="scales routed output when --norm-topk-prob is off")
-parser.add_argument("--aux-loss-alpha", type=float, default=0.001, help="MoE load-balancing aux loss weight")
-parser.add_argument("--no-seq-aux", action="store_true", help="use global (not per-sequence) aux loss")
-# Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
-parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
-parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
-# Optimization
-parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
-parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
-parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
-parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
-# Evaluation
-parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
-parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
-# Output
-parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
-args = parser.parse_args()
-if args.mtp and args.fp8:
-    parser.error('MTP training currently requires BF16/FP32 (shifted loss shapes are not FP8-aligned)')
-if not math.isfinite(args.mtp_loss_weight) or args.mtp_loss_weight < 0:
-    parser.error('mtp-loss-weight must be finite and non-negative')
-if args.loss_chunk_size < 0 or args.muon_bucket_mb < 0:
-    parser.error("loss-chunk-size and muon-bucket-mb must be non-negative")
-if min(args.depth, args.aspect_ratio, args.head_dim, args.max_seq_len, args.device_batch_size) <= 0:
-    parser.error("model dimensions, sequence length and device batch size must be positive")
-if args.head_dim % 2 or args.n_kv_head == 0 or args.n_kv_head < -1:
-    parser.error("head-dim must be even; n-kv-head must be -1 or positive")
-if args.moe_layer_freq <= 0 or args.first_k_dense_replace < 0 or args.n_shared_experts < 0 or args.moe_intermediate_mult <= 0:
-    parser.error("invalid MoE placement or expert dimensions")
-if args.total_batch_size != -1 and args.total_batch_size <= 0:
-    parser.error("total-batch-size must be positive or -1")
-if args.warmup_steps < 0 or not 0 <= args.warmdown_ratio <= 1 or not 0 <= args.final_lr_frac <= 1:
-    parser.error("invalid learning-rate schedule")
-if args.fp8 and ((args.device_batch_size * args.max_seq_len) % 16 or args.loss_chunk_size % 16):
-    parser.error("FP8 requires microbatch tokens and loss-chunk-size to be multiples of 16")
-user_config = vars(args).copy()  # for logging
-# -----------------------------------------------------------------------------
-# Compute init and wandb logging
-
-device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
-if device_type == "cuda":
-    gpu_device_name = torch.cuda.get_device_name(0)
-    gpu_peak_flops = get_peak_flops(gpu_device_name)
-    print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
-else:
-    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
-print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-
-# wandb logging init
-use_dummy_wandb = args.dry_run or args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
-
-# Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3 and args.attention_type == "gqa"
-if args.attention_type == "mla":
-    print0("MLA: PyTorch SDPA training/prefill, absorbed latent-cache decode; no FlashMLA backend. Value embeddings disabled.")
-elif using_fa3:
-    print0("✓ Using Flash Attention 3: efficient, new and awesome.")
-else:
-    print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
-    else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
-    print0("!" * 80)
-
-# -----------------------------------------------------------------------------
-# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = None if args.dry_run else get_tokenizer()
-token_bytes = None if args.dry_run else get_token_bytes(device=device)
-vocab_size = args.vocab_size if args.dry_run else tokenizer.get_vocab_size()
-print0(f"Vocab size: {vocab_size:,}")
-
-# -----------------------------------------------------------------------------
-# Initialize the Model
-
-def build_model_meta(depth, reference=False):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-    num_heads = model_dim // args.head_dim
-    num_kv_heads = num_heads if args.n_kv_head == -1 else args.n_kv_head
-    if args.attention_type == "gqa" and (num_kv_heads > num_heads or num_heads % num_kv_heads != 0):
-        if not reference:
-            raise ValueError(f"n-kv-head ({num_kv_heads}) must divide query heads ({num_heads})")
-        num_kv_heads = num_heads
-    config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
-        mtp_enabled=args.mtp, mtp_loss_weight=args.mtp_loss_weight,
-        mtp_bos_token_id=tokenizer.get_bos_token_id() if args.mtp and tokenizer is not None else -1,
-        attention_type=args.attention_type, q_lora_rank=args.q_lora_rank, kv_lora_rank=args.kv_lora_rank,
-        qk_nope_head_dim=args.qk_nope_head_dim, qk_rope_head_dim=args.qk_rope_head_dim, v_head_dim=args.v_head_dim,
-        n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
-        num_experts_per_tok=args.num_experts_per_tok, moe_intermediate_mult=args.moe_intermediate_mult,
-        first_k_dense_replace=args.first_k_dense_replace, moe_layer_freq=args.moe_layer_freq,
-        topk_method=args.topk_method, n_group=args.n_group, topk_group=args.topk_group,
-        norm_topk_prob=args.norm_topk_prob, routed_scaling_factor=args.routed_scaling_factor,
-        aux_loss_alpha=args.aux_loss_alpha, seq_aux=not args.no_seq_aux,
-    )
-    with torch.device("meta"):
-        model_meta = GPT(config)
-    return model_meta
-
-# Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
-model_config = model.config
-model_config_kwargs = asdict(model_config)
-print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-if args.n_routed_experts > 0 and ddp_world_size > 1:
-    assert args.n_routed_experts % ddp_world_size == 0, f"--n-routed-experts ({args.n_routed_experts}) must be divisible by world size ({ddp_world_size})"
-if args.dry_run:
-    counts = model.num_scaling_params()
-    print0(json.dumps(dict(parameter_counts=counts, active_matmul_params=model.num_matmul_params(active=True),
-                           training_flops_per_token=model.estimate_flops(), kv_bytes_per_token=model.kv_bytes_per_token(),
-                           compute_dtype=str(COMPUTE_DTYPE)), indent=2))
-    print0("Meta-only check: no weights allocated and no training performed.")
-    wandb_run.finish()
-    compute_cleanup()
-    raise SystemExit(0)
-if args.fp8 and (device_type != "cuda" or torch.cuda.get_device_capability(device)[0] < 9 or COMPUTE_DTYPE != torch.bfloat16):
-    raise ValueError("This FP8 training path requires SM90+ CUDA and bfloat16 compute")
-model.activation_checkpointing = args.activation_checkpointing
-model.loss_chunk_size = args.loss_chunk_size
-
-# Initialize new weights, or assign checkpoint tensors directly to the meta model.
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
-if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    saved_config = GPTConfig(**meta_data["model_config"])
-    if asdict(saved_config) != model_config_kwargs:
-        raise ValueError("Resume model configuration differs from checkpoint; restore the original architecture arguments")
-    if meta_data.get("world_size", ddp_world_size) != ddp_world_size:
-        raise ValueError("Optimizer resume requires the same world size")
-    if meta_data.get("user_config", {}).get("muon_bucket_mb", 0) != args.muon_bucket_mb:
-        raise ValueError("Optimizer resume requires the original --muon-bucket-mb")
-    model.load_state_dict(model_data, strict=True, assign=True)
-    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, model_config.rotary_dim)
-    del model_data
-else:
-    model.to_empty(device=device)
-    model.init_weights()
-
-# -----------------------------------------------------------------------------
-# FP8 training initialization and management (this has to be done before torch.compile)
-
-# Convert Linear layers to Float8Linear if --fp8 is set
-if args.fp8:
-    if device_type != "cuda":
-        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
-    else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
-
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            # Routed experts see a variable token count M; the grad_weight GEMM in FP8 backward
-            # contracts over M and _scaled_mm requires that to be a multiple of 16 => would crash.
-            # (Shared experts see all tokens, so they are fine and stay eligible.)
-            if ".experts." in fqn or (args.attention_type == "mla" and ".attn." in fqn):
-                return False
-            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
-                return False
-            return True
-
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
-
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
-@contextmanager
-def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
-
-    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
-    """
-    import torch.nn as nn
-
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
-    for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
-            if '.' in name:
-                parent_name, attr_name = name.rsplit('.', 1)
-                parent = model.get_submodule(parent_name)
-            else:
-                parent = model
-                attr_name = name
-            fp8_locations.append((parent, attr_name, module))
-
-    if not fp8_locations:
-        yield  # No FP8 modules, nothing to do
-        return
-
-    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
-    # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
-    for parent, attr_name, fp8_module in fp8_locations:
-        linear = Linear(
-            fp8_module.in_features,
-            fp8_module.out_features,
-            bias=fp8_module.bias is not None,
-            device="meta",  # Use meta device to avoid unnecessary VRAM allocation
-            dtype=fp8_module.weight.dtype,
-        )
-        linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
-        setattr(parent, attr_name, linear)
-
-    try:
-        yield
-    finally:
-        # Restore Float8Linear modules
-        for parent, attr_name, fp8_module in fp8_locations:
-            setattr(parent, attr_name, fp8_module)
-
-# -----------------------------------------------------------------------------
-# Compile the model
-
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-if not args.no_compile:
-    model = torch.compile(model, dynamic=False)
-
-# -----------------------------------------------------------------------------
-# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
-
-# Get the parameter counts of our model
-param_counts = model.num_scaling_params()
-print0(f"Parameter counts:")
-for key, value in param_counts.items():
-    print0(f"{key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-# 1) Use scaling laws to determine the optimal training horizon in tokens
-# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
-def get_scaling_params(m):
-    # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
-    # Active parameters are a budget heuristic for MoE, not a validated compute-optimal data law.
-    # Total expert capacity, routing and data quality still affect the required training tokens.
-    params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices_active'] + params_counts['lm_head']
-    return scaling_params
-num_scaling_params = get_scaling_params(model)
-scaling_ratio = args.target_param_data_ratio if args.target_param_data_ratio > 0 else 12
-if args.target_param_data_ratio <= 0 and args.num_iterations <= 0 and args.target_flops <= 0:
-    raise ValueError("Specify a positive training horizon")
-target_tokens = int(scaling_ratio * num_scaling_params)
-
-# The d12 extrapolation is an initial heuristic, not a measured MoE scaling law.
-d12_ref = build_model_meta(12, reference=True)
-D_REF = scaling_ratio * get_scaling_params(d12_ref)
-B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
-
-# 2) Now that we have the token horizon, we can calculate the optimal batch size
-# We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
-# The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
-total_batch_size = args.total_batch_size # user-provided override is possible
-if total_batch_size == -1:
-    batch_size_ratio = target_tokens / D_REF
-    predicted_batch_size = B_REF * batch_size_ratio ** 0.383
-    total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
-    print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
-
-# 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
-batch_lr_scale = 1.0
-batch_ratio = total_batch_size / B_REF # B/B_ref
-if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
-    batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
-    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
-
-# 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
-# We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
-# Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
-# Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
-# λ = λ_ref · √(B/B_ref) · (D_ref/D)
-# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
-weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
-if weight_decay_scaled != args.weight_decay:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
-
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-    muon_bucket_mb=args.muon_bucket_mb,
+from nanochat.common import get_base_dir
+from nanochat.scratch import (
+    ByteTokenizer, Dataset, GPT, GPTConfig, addition_entropy_floor, evaluate_bpb,
+    find_last_step, load_checkpoint, make_addition_corpus, no_grad, save_checkpoint,
+    setup_optimizer, token_bytes_table,
 )
 
-if resuming:
-    optimizer.load_state_dict(optimizer_data)
-    del optimizer_data
 
-# -----------------------------------------------------------------------------
-# GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
-scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
-if scaler is not None:
-    print0("GradScaler enabled for fp16 training")
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    # model: one dial, as upstream
+    p.add_argument("--depth", type=int, default=4, help="number of layers; width is derived from it")
+    p.add_argument("--sequence-len", type=int, default=64)
+    p.add_argument("--window-pattern", type=str, default="SSSL")
+    # moe
+    p.add_argument("--n-routed-experts", type=int, default=0, help="0 => dense model")
+    p.add_argument("--n-shared-experts", type=int, default=0)
+    p.add_argument("--num-experts-per-tok", type=int, default=2)
+    p.add_argument("--aux-loss-alpha", type=float, default=0.001)
+    # optimization
+    p.add_argument("--num-iterations", type=int, default=400)
+    p.add_argument("--batch-size", type=int, default=16, help="rows per micro-batch")
+    p.add_argument("--grad-accum-steps", type=int, default=1)
+    p.add_argument("--matrix-lr", type=float, default=0.03)
+    p.add_argument("--embedding-lr", type=float, default=0.2)
+    p.add_argument("--unembedding-lr", type=float, default=0.02)
+    p.add_argument("--scalar-lr", type=float, default=0.05)
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--final-lr-frac", type=float, default=0.1)
+    # eval / checkpointing
+    p.add_argument("--eval-every", type=int, default=100, help="-1 to disable")
+    p.add_argument("--eval-batches", type=int, default=10)
+    p.add_argument("--save-every", type=int, default=-1, help="-1 => only at the end")
+    p.add_argument("--run", type=str, default="base", help="checkpoint subdirectory name")
+    p.add_argument("--resume", action="store_true", help="resume from the last checkpoint")
+    # data
+    p.add_argument("--text-file", type=str, default=None)
+    p.add_argument("--corpus-lines", type=int, default=20000)
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
 
-# -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
-# -----------------------------------------------------------------------------
-# Calculate the number of iterations we will train for and set up the various schedulers
+def derive_config(args, vocab_size):
+    """Width, heads and head_dim from depth alone.
 
-# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
-assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
-if args.num_iterations > 0:
-    # Override num_iterations to a specific value if given
-    num_iterations = args.num_iterations
-    print0(f"Using user-provided number of iterations: {num_iterations:,}")
-elif args.target_flops > 0:
-    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
-    num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
-    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
-elif args.target_param_data_ratio > 0:
-    # Calculate the number of iterations from the target param data ratio (the most common use case)
-    num_iterations = target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
-else:
-    raise ValueError("No training horizon specified")
-if num_iterations <= 0:
-    raise ValueError("Training budget is smaller than one optimizer step")
-if resuming:
-    if not 0 <= meta_data["step"] <= num_iterations:
-        raise ValueError("Resume step exceeds the requested training horizon")
-    if meta_data.get("total_batch_size", total_batch_size) != total_batch_size:
-        raise ValueError("Resume requires the original total-batch-size")
-    if meta_data.get("num_iterations", num_iterations) != num_iterations:
-        print0("WARNING: changing the training horizon changes the resumed learning-rate schedule")
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
-print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
-print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+    Keeps head_dim at 16 and scales width with depth, which is the usual
+    compute-optimal shape (aspect ratio roughly constant). n_kv_head is half of
+    n_head, i.e. 2x GQA sharing.
+    """
+    depth = args.depth
+    n_head = max(2, depth)
+    n_embd = max(24, 16 * n_head)
+    return GPTConfig(
+        sequence_len=args.sequence_len, vocab_size=vocab_size,
+        n_layer=depth, n_head=n_head, n_kv_head=max(1, n_head // 2), n_embd=n_embd,
+        window_pattern=args.window_pattern,
+        n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
+        num_experts_per_tok=args.num_experts_per_tok, aux_loss_alpha=args.aux_loss_alpha,
+    )
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
-def get_lr_multiplier(it):
-    warmup_iters = args.warmup_steps
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if it < warmup_iters:
-        return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
+
+def lr_scale(step, total, warmup_ratio, final_frac):
+    """Linear warmup, then cosine decay to `final_frac` of peak."""
+    warmup = max(1, int(total * warmup_ratio))
+    if step < warmup:
+        return (step + 1) / warmup
+    t = (step - warmup) / max(total - warmup, 1)
+    return final_frac + (1 - final_frac) * 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
+
+
+@no_grad()
+def eval_bpb(model, dataset, token_bytes, args, split="val"):
+    model.eval()
+    n = dataset.num_sequential_batches(args.batch_size, args.sequence_len, split)
+    steps = min(args.eval_batches, n)
+    if steps == 0:
+        model.train()
+        return float("nan")
+    bpb = evaluate_bpb(model, dataset.sequential_batches(args.batch_size, args.sequence_len, split),
+                       steps, token_bytes)
+    model.train()
+    return bpb
+
+
+def main():
+    args = parse_args()
+    np.random.seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+
+    tokenizer = ByteTokenizer()
+    if args.text_file:
+        with open(args.text_file, encoding="utf-8") as f:
+            text = f.read()
+        floor = None
     else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        text = make_addition_corpus(args.corpus_lines, seed=args.seed)
+        floor = addition_entropy_floor()
+    dataset = Dataset.from_text(text, tokenizer)
+    token_bytes = token_bytes_table(tokenizer)
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
-def get_muon_momentum(it):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    warmdown_start = num_iterations - warmdown_iters
-    if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
-    else:
-        return 0.97
+    out_dir = os.path.join(get_base_dir(), "checkpoints", args.run)
+    os.makedirs(out_dir, exist_ok=True)
 
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
-def get_weight_decay(it):
-    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
+    config = derive_config(args, tokenizer.get_vocab_size())
+    model = GPT(config)
+    optimizer = setup_optimizer(
+        model, unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr,
+        matrix_lr=args.matrix_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay)
 
-# -----------------------------------------------------------------------------
-# Training loop
-
-# Loop state (variables updated by the training loop)
-if not resuming:
-    step = 0
-    val_bpb = None # will be set if eval_every > 0
-    min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
-    total_training_time = 0 # total wall-clock time of training
-else:
-    step = meta_data["step"]
-    loop_state = meta_data["loop_state"]
-    val_bpb = meta_data["val_bpb"]
-    min_val_bpb = loop_state["min_val_bpb"]
-    smooth_train_loss = loop_state["smooth_train_loss"]
-    total_training_time = loop_state["total_training_time"]
-
-# Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0, f"total_batch_size ({total_batch_size}) must be a multiple of {world_tokens_per_fwdbwd}."
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-
-# Go!
-while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
-
-    # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
-        val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        })
-        model.train()
-
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
-    results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
-
-    # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-        model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
-        model.train()
-
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "num_iterations": num_iterations,
-                "world_size": ddp_world_size,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "total_batch_size": total_batch_size,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
-            },
-            rank=ddp_rank,
-        )
-
-    # termination conditions (TODO: possibly also add loss explosions etc.)
-    if last_step:
-        break
-
-    # -------------------------------------------------------------------------
-    # single training step
-    # evaluate the gradient
-    synchronize()
-    t0 = time.time()
-    loss_stats = torch.zeros(3, device=device)
-    for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        aux = orig_model.collect_aux_loss() # MoE load-balancing loss (already included in `loss`), None for dense
-        train_aux = aux.detach() if aux is not None else None
-        loss_stats[0].add_(train_loss)
-        if train_aux is not None:
-            loss_stats[1].add_(train_aux)
-        mtp_aux = orig_model.collect_mtp_loss()
-        if mtp_aux is not None:
-            loss_stats[2].add_(mtp_aux)
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
+    start_step = 0
+    if args.resume:
+        last = find_last_step(out_dir)
+        if last is None:
+            print(f"--resume: nothing to resume in {out_dir}, starting fresh")
         else:
-            loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    loss_stats.div_(grad_accum_steps)
-    if is_ddp_initialized():
-        dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
-        loss_stats.div_(ddp_world_size)
-    train_total_f, train_aux_f, train_mtp_f = loss_stats.tolist()
-    if not all(math.isfinite(v) for v in (train_total_f, train_aux_f, train_mtp_f)):
-        raise FloatingPointError(f"Non-finite training loss at step {step}; optimizer not updated")
-    train_loss_f = train_total_f - train_aux_f - train_mtp_f
-    # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
+            model, meta = load_checkpoint(out_dir, last, model=model, optimizer=optimizer)
+            start_step = meta["step"] + 1
+            print(f"resumed from step {meta['step']} (val bpb {meta.get('val_bpb', float('nan')):.4f})")
+
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+    tokens_per_step = args.batch_size * args.sequence_len * args.grad_accum_steps
+    kind = "MoE" if args.n_routed_experts > 0 else "dense"
+
+    print(f"base_train | {kind} d{config.n_layer} w{config.n_embd} | "
+          f"{model.num_parameters():,} params | vocab {config.vocab_size}")
+    print(f"{len(dataset.train):,} train / {len(dataset.val):,} val tokens | "
+          f"{tokens_per_step:,} tokens/step x {args.num_iterations} steps")
+    if floor is not None:
+        print(f"task: 2-digit addition | loss floor {floor:.4f} nats "
+              f"| bpb floor {floor / math.log(2):.4f}")
+    print(f"checkpoints -> {out_dir}")
+    print("-" * 76)
+
+    t0 = time.time()
+    for step in range(start_step, args.num_iterations):
+        scale = lr_scale(step, args.num_iterations, args.warmup_ratio, args.final_lr_frac)
+        for group, base in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = base * scale
+
+        # Gradient accumulation: average the loss over micro-batches so the gradient
+        # matches one big batch rather than being grad_accum_steps times too large.
+        optimizer.zero_grad()
+        total = 0.0
+        for _ in range(args.grad_accum_steps):
+            loss = model(*dataset.get_batch(args.batch_size, args.sequence_len, rng))
+            (loss / args.grad_accum_steps).backward()
+            total += loss.item() / args.grad_accum_steps
         optimizer.step()
-    model.zero_grad(set_to_none=True)
-    synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-    # -------------------------------------------------------------------------
 
-    # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * step / num_iterations
-    tok_per_sec = int(total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * total_batch_size / dt
-    mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
-    if step > 10:
-        total_training_time += dt # only count the time after the first 10 steps
-    # Calculate ETA based on average time per step (excluding first 10 steps)
-    steps_done = step - 10
-    if steps_done > 0:
-        avg_time_per_step = total_training_time / steps_done
-        remaining_steps = num_iterations - step
-        eta_seconds = remaining_steps * avg_time_per_step
-        eta_str = f" | eta: {eta_seconds/60:.1f}m"
-    else:
-        eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    aux_str = f" | aux: {train_aux_f:.5f}" if train_aux is not None else ""
-    if args.mtp:
-        aux_str += f" | mtp: {train_mtp_f:.5f}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{aux_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": epoch,
-        }
-        if train_aux is not None:
-            log_data["train/aux_loss"] = train_aux_f
-        if args.mtp:
-            log_data["train/mtp_loss"] = train_mtp_f
-        wandb_run.log(log_data)
+        is_last = step == args.num_iterations - 1
+        if (args.eval_every > 0 and step % args.eval_every == 0) or is_last:
+            bpb = eval_bpb(model, dataset, token_bytes, args)
+            print(f"step {step:5d} | train {total:.4f} | val bpb {bpb:.4f} "
+                  f"| lr x{scale:.2f} | {time.time() - t0:6.1f}s")
+        if (args.save_every > 0 and step % args.save_every == 0) or is_last:
+            save_checkpoint(out_dir, step, model, optimizer,
+                            meta={"val_bpb": eval_bpb(model, dataset, token_bytes, args),
+                                  "train_loss": total, "depth": args.depth})
 
-    # state update
-    first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
-    step += 1
+    print("-" * 76)
+    final = eval_bpb(model, dataset, token_bytes, args)
+    print(f"done in {time.time() - t0:.1f}s | final val bpb {final:.4f}")
+    if floor is not None:
+        print(f"gap to bpb floor: {final - floor / math.log(2):+.4f}")
+    print(f"last checkpoint: step_{find_last_step(out_dir):06d} in {out_dir}")
+    print("next: python -m scripts.base_eval --run", args.run)
 
-    # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
-    # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
-    # So we manually manage and help it out here
-    if first_step_of_run:
-        gc.collect() # manually collect a lot of garbage from setup
-        gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
-        gc.disable() # nuclear intervention here: disable GC entirely except:
-    elif step % 5000 == 0: # every 5000 steps...
-        gc.collect() # manually collect, just to be safe for very, very long runs
 
-# print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-print0(f"Total training time: {total_training_time/60:.2f}m")
-if val_bpb is not None:
-    print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
-
-# cleanup
-wandb_run.finish() # wandb run finish
-compute_cleanup()
+if __name__ == "__main__":
+    main()

@@ -1,9 +1,19 @@
 """
-BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken.
+BPE Tokenizer in the style of GPT-4.
+
+By default both training and inference use the hand-written BPE in `nanochat/bpe.py`
+(pure Python, standard library only), so the whole tokenizer is steppable in a debugger.
+
+The Rust stack (rustbpe for training, tiktoken for inference) stays available behind
+`NANOCHAT_BPE_BACKEND=rust`, because pure Python encodes roughly 100x slower and
+pretraining tokenizes on the fly. Both backends are verified to produce *identical*
+merge ranks and identical token ids in `tests/test_bpe.py`, so the choice is purely
+speed, never behaviour.
 """
 
 import os
 import copy
+import pickle
 
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
@@ -22,16 +32,50 @@ SPECIAL_TOKENS = [
 # NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
 # I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
 # I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
+# `nanochat/bpe.py` hand-codes this same pattern as a scanner; it only needs to be a regex
+# string for the optional rustbpe/tiktoken backend.
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 # -----------------------------------------------------------------------------
-# Tokenizer based on rustbpe + tiktoken combo
-import pickle
-import rustbpe
-import tiktoken
+# Backend selection
+
+BACKENDS = ("scratch", "rust")
+
+
+def get_backend():
+    """Which BPE implementation to use: 'scratch' (hand-written) or 'rust'."""
+    backend = os.environ.get("NANOCHAT_BPE_BACKEND", "scratch").lower()
+    if backend not in BACKENDS:
+        raise ValueError(f"NANOCHAT_BPE_BACKEND must be one of {BACKENDS}, got {backend!r}")
+    return backend
+
+
+def _build_rust_encoding(mergeable_ranks, special_tokens):
+    """Wrap ranks in a tiktoken Encoding (the fast inference backend)."""
+    import tiktoken
+    return tiktoken.Encoding(
+        name="rustbpe",
+        pat_str=SPLIT_PATTERN,
+        mergeable_ranks=mergeable_ranks, # dict[bytes, int] (token bytes -> merge priority rank)
+        special_tokens=special_tokens, # dict[str, int] (special token name -> token id)
+    )
+
+
+def _build_encoding(mergeable_ranks, special_tokens, backend=None):
+    backend = backend or get_backend()
+    if backend == "rust":
+        return _build_rust_encoding(mergeable_ranks, special_tokens)
+    from nanochat.bpe import BPE
+    return BPE(mergeable_ranks, special_tokens)
+
 
 class RustBPETokenizer:
-    """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
+    """Tokenizer wrapper. Named for history; the default backend is the hand-written BPE.
+
+    Holds an encoding object exposing a small tiktoken-compatible surface
+    (`encode_ordinary`, `decode`, `_mergeable_ranks`, ...). `nanochat.bpe.BPE` implements
+    that surface, so this class is backend-agnostic.
+    """
 
     def __init__(self, enc, bos_token):
         self.enc = enc
@@ -45,41 +89,53 @@ class RustBPETokenizer:
         self.bos_token_id = self.encode_special(bos_token)
 
     @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size):
-        # 1) train using rustbpe
-        tokenizer = rustbpe.Tokenizer()
-        # the special tokens are inserted later in __init__, we don't train them here
+    def train_from_iterator(cls, text_iterator, vocab_size, backend=None):
+        backend = backend or get_backend()
+        # the special tokens are inserted after training, we don't train them here
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
         assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
-        tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
-        # 2) construct the associated tiktoken encoding for inference
-        pattern = tokenizer.get_pattern()
-        mergeable_ranks_list = tokenizer.get_mergeable_ranks()
-        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
+        if backend == "rust":
+            import rustbpe
+            tokenizer = rustbpe.Tokenizer()
+            tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
+            mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
+        else:
+            from nanochat.bpe import train_bpe
+            mergeable_ranks = train_bpe(text_iterator, vocab_size_no_special)
         collisions = [name for name in SPECIAL_TOKENS if name.encode("utf-8") in mergeable_ranks]
         if collisions:
             raise ValueError(f"Trained vocabulary contains special token byte strings: {collisions}")
         tokens_offset = len(mergeable_ranks)
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-        enc = tiktoken.Encoding(
-            name="rustbpe",
-            pat_str=pattern,
-            mergeable_ranks=mergeable_ranks, # dict[bytes, int] (token bytes -> merge priority rank)
-            special_tokens=special_tokens, # dict[str, int] (special token name -> token id)
-        )
-        return cls(enc, "<|bos|>")
+        return cls(_build_encoding(mergeable_ranks, special_tokens, backend), "<|bos|>")
 
     @classmethod
-    def from_directory(cls, tokenizer_dir):
+    def from_directory(cls, tokenizer_dir, backend=None):
+        """Load a saved tokenizer, accepting both the portable and the legacy format.
+
+        Saved files are backend-independent: only the ranks and special tokens are stored,
+        and the encoding object is rebuilt locally. Legacy checkpoints hold a pickled
+        `tiktoken.Encoding`, which is still readable.
+        """
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
         with open(pickle_path, "rb") as f:
-            enc = pickle.load(f)
+            payload = pickle.load(f)
+        if isinstance(payload, dict) and "mergeable_ranks" in payload:
+            enc = _build_encoding(payload["mergeable_ranks"], payload["special_tokens"], backend)
+        else:
+            # Legacy: a pickled tiktoken.Encoding. Pull the ranks out and rebuild, so the
+            # configured backend still applies.
+            enc = _build_encoding(payload._mergeable_ranks, payload._special_tokens, backend)
         return cls(enc, "<|bos|>")
 
     @classmethod
     def from_pretrained(cls, tiktoken_name):
         # https://github.com/openai/tiktoken/blob/eedc8563/tiktoken_ext/openai_public.py
-        enc = tiktoken.get_encoding(tiktoken_name)
+        # Loading OpenAI's published vocabularies needs tiktoken regardless of backend:
+        # the ranks ship inside that package. The hand-written BPE can still *use* them.
+        import tiktoken
+        published = tiktoken.get_encoding(tiktoken_name)
+        enc = _build_encoding(published._mergeable_ranks, published._special_tokens)
         # tiktoken calls the special document delimiter token "<|endoftext|>"
         # yes this is confusing because this token is almost always PREPENDED to the beginning of the document
         # it most often is used to signal the start of a new sequence to the LLM during inference etc.
@@ -141,11 +197,16 @@ class RustBPETokenizer:
         return self.enc.decode_single_token_bytes(token_id)
 
     def save(self, tokenizer_dir):
-        # save the encoding object to disk
+        # Save ranks + special tokens, not the encoding object. This keeps the file
+        # portable between backends and independent of any library's pickle layout.
         os.makedirs(tokenizer_dir, exist_ok=True)
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
+        payload = {
+            "mergeable_ranks": dict(self.enc._mergeable_ranks),
+            "special_tokens": dict(self.enc._special_tokens),
+        }
         with open(pickle_path, "wb") as f:
-            pickle.dump(self.enc, f)
+            pickle.dump(payload, f)
         print(f"Saved tokenizer encoding to {pickle_path}")
 
     def render_conversation(self, conversation, max_tokens=2048):
@@ -280,14 +341,3 @@ def get_tokenizer():
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
     return RustBPETokenizer.from_directory(tokenizer_dir)
-
-def get_token_bytes(device="cpu"):
-    import torch
-    from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
-    with open(token_bytes_path, "rb") as f:
-        token_bytes = torch.load(f, map_location=device)
-    return token_bytes

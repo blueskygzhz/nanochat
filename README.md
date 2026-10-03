@@ -1,307 +1,143 @@
-# nanochat
+# nanochat (from scratch, no framework)
 
-![nanochat logo](dev/nanochat.png)
-![scaling laws](dev/scaling_laws_jan26.png)
+This is a fork of [nanochat](https://github.com/karpathy/nanochat) with **PyTorch removed entirely**. Nothing here imports a deep learning framework. The autograd engine, the module system, the layers, the optimizers, the tokenizer and the model are all written out by hand.
 
-nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, and inference. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it over a simple CLI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
-
-For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
-
-## Time-to-GPT-2 Leaderboard
-
-Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. The [runs/speedrun.sh](runs/speedrun.sh) script always reflects the reference way to train GPT-2 grade model and talk to it. The current leaderboard looks as follows:
-
-| # | time | val_bpb | CORE | Description | Date | Commit | Contributors |
-|---|-------------|---------|------|-------------|------|--------|--------------|
-| 0 | 168 hours | - | 0.2565 | Original OpenAI GPT-2 checkpoint | 2019 | - | OpenAI |
-| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 | @karpathy |
-| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained **+fp8** | Feb 2 2026 | a67eba3 | @karpathy |
-| 3 | 2.76 | 0.74645 | 0.2602 | bump total batch size to 1M tokens | Feb 5 2026 | 2c062aa | @karpathy |
-| 4 | 2.02 | 0.71854 | 0.2571 | change dataset to NVIDIA ClimbMix | Mar 4 2026 | 324e69c | @ddudek @karpathy |
-| 5 | 1.80 | 0.71808 | 0.2690 | autoresearch [round 1](https://x.com/karpathy/status/2031135152349524125) | Mar 9 2026 | 6ed7d1d | @karpathy |
-| 6 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 | @karpathy |
-
-The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
-
-See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
-
-## Getting started
-
-### Setup
-
-nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To install:
+numpy is the only runtime dependency that does any math, and it supplies exactly two things: an n-dimensional array and a BLAS matrix multiply. It provides no automatic differentiation, no layers, no optimizers and no model — that is all code in this repo.
 
 ```bash
-uv sync --extra gpu    # Use for CUDA (A100/H100/etc.)
-uv sync --extra cpu    # (or) Use for CPU-only / MPS
+uv sync --group dev
 source .venv/bin/activate
+python -m scripts.scratch_train
 ```
 
-For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
+```
+from-scratch nanochat | dense | 229,458 params | 126,000 train tokens
+task: 2-digit addition | entropy floor: 0.6579 nats/token | uniform-byte baseline: 5.5452
+--------------------------------------------------------------------
+step    0 | train 5.5446 | val 5.5042 |    0.4s | gap to floor +4.8464
+step  100 | train 0.7795 | val 0.7681 |   11.3s | gap to floor +0.1103
+step  199 | train 0.6908 | val 0.6953 |   22.2s | gap to floor +0.0374
+--------------------------------------------------------------------
+greedy addition accuracy: 17/20
+```
+
+The loss starts at 5.5446, which is `ln(256)` — a model that knows nothing about bytes. It ends 0.037 nats above the information-theoretic floor of the task, in 22 seconds on one CPU core.
+
+## Read this first: what this fork is and is not
+
+The upstream project trains a GPT-2 capability model on an 8×H100 node in under two hours. **This fork cannot do that, and never will.** Removing PyTorch deleted 9,118 lines across 27 files, and with them:
+
+- GPU training of any kind (no CUDA kernels)
+- distributed training (NCCL cannot be implemented in Python)
+- FlashAttention, FP8, bf16, `torch.compile`
+- the inference engine with KV caching, SFT, RL
+- MLA, MTP, and the 7.26B-total MoE run
+- GPT-2 / GPT-3 parity, the CORE evaluation, and the speedrun leaderboard
+
+What is left runs single-threaded float32 on CPU with naive O(T²) attention. It is many orders of magnitude slower than the real thing. Its demonstrated capability is a 229K-parameter model that learns one-digit addition in 22 seconds.
+
+**If you want to train a usable language model, use [upstream nanochat](https://github.com/karpathy/nanochat).** This fork exists to make every step of training readable — there is no layer you cannot step into with a debugger.
+
+## What's in it
+
+| File | Replaces | Lines | What's in it |
+|------|----------|-------|--------------|
+| `nanochat/scratch/tensor.py` | `torch.Tensor`, `torch.autograd` | 660 | Reverse-mode AD: per-op backward closures, reverse-topological backward pass, broadcasting adjoints, fused `softmax`/`cross_entropy`/`rms_norm`, and the `topk`/`index_add` scatter-gather pair the MoE router needs |
+| `nanochat/scratch/nn.py` | `torch.nn` | 257 | `Module.__setattr__` parameter/submodule registration, `named_parameters`, `state_dict`, `Linear`, `Embedding`, naive attention with GQA and sliding-window masks |
+| `nanochat/scratch/model.py` | `nanochat/gpt.py` | 425 | RMSNorm, RoPE + QK-norm, ResFormer value embeddings, embedding smear, per-layer resid/x0 scalars, mid-layer backout, ReLU² FFNs, DeepSeek-V2 MoE with load-balancing aux loss, tanh-softcapped logits |
+| `nanochat/scratch/optim.py` | `torch.optim`, `nanochat/optim.py` | 226 | AdamW with decoupled decay, and Muon (Polar Express orthogonalization, no SVD) |
+| `nanochat/scratch/data.py` | `nanochat/dataloader.py` | 77 | Byte tokenizer and batch sampler |
+| `nanochat/bpe.py` | `rustbpe`, `tiktoken` | 402 | Byte-level BPE: training (merge counting with incremental updates) and inference, standard library only |
+
+## Usage
 
 ```bash
-uv sync --extra gpu --group dev
+python -m scripts.scratch_train                        # dense
+python -m scripts.scratch_train --n-routed-experts 4   # MoE
+python -m scripts.scratch_train --text-file book.txt   # your own text
+python -m scripts.scratch_train --help                 # all knobs
 ```
 
-### 本分支：实验性 7B MoE 训练
+The default task is two-digit addition (`"7+5=12;"`). That choice is deliberate: its entropy is known exactly, so there is a real target to hit rather than just a loss curve that goes down. Every character of a line is determined by the two operands, so the only information in the stream is those operands:
 
-`runs/moe7b.sh` 配置为 **7.26B 总参数 MoE**，不是 7B 稠密模型：24 层、宽度 2048、16 个 Q heads / 4 个 KV heads、48 个路由专家（top-6）+ 2 个共享专家。激活 Transformer 参数约 1.35B，含 LM head 的激活矩阵约 1.42B。默认约 49.6B tokens 仅为首轮实验预算，不保证收敛或达到其他 7B 模型的能力。
+\[
+H = \frac{2\ln 10}{7} = 0.6579 \text{ nats/token}
+\]
 
-先完成上面的环境安装，并将 `NANOCHAT_BASE_DIR` 设在容量充足的持久化磁盘。参考硬件为单机 8×80GB CUDA GPU；所有参数和梯度仍在每卡复制，只有优化器状态分片，实际显存与速度必须先测。
+A model at ~0.66 has learned to carry. A model at ~2.3 has only learned character frequencies.
 
-| 操作 | 命令 | 说明 |
-|---|---|---|
-| 模型预检查 | `bash runs/moe7b.sh check` | 默认模式；不下载语料、不分配 7B 权重、不训练 |
-| 准备语料与 tokenizer | `bash runs/moe7b.sh prepare` | 默认下载 1400 个训练分片，可用 `SHARDS` 调整；预留百 GB 级空间 |
-| 7B 冒烟验证 | `bash runs/moe7b.sh smoke` | 真实 7B 模型跑 5 步，每步一个 microbatch；保存至独立的 `moe7b-smoke` 标签 |
-| 正式预训练 | `bash runs/moe7b.sh train` | 不自动执行 SFT；默认 BF16、每卡 batch=1 |
-| 恢复预训练 | `RESUME_STEP=2000 bash runs/moe7b.sh train` | 架构、world size、Muon 桶大小和总 batch 必须与原训练一致 |
-| 评测 / SFT | `bash runs/moe7b.sh eval` / `bash runs/moe7b.sh sft` | SFT 继承分块 loss、激活重计算和优化器桶配置 |
-| RL（GSM8K） | `bash runs/moe7b.sh rl` | 从 SFT checkpoint 继承上述显存设置及 MoE/MLA/MTP 架构；保留 MoE 负载均衡 loss |
+## How the gradients are verified
 
-SFT 的 `--num-iterations=N` 精确执行 N 次优化器更新（与梯度累积步数无关），学习率按 `step/N` 调度，数据不足时自动进入下一轮；`-1` 表示跑满一个 epoch。超过一行容量（`max_seq_len+1` token）的对话会被截断到一行并计数告警，不再导致打包卡死；需要完整保留时请增大 `--max-seq-len`。
+There is no framework to compare against, so correctness is established from first principles. For every operation, the analytic backward is checked against a central finite difference of the forward:
 
-显存余量足够后，可将 `DEVICE_BATCH` 逐步调至 2 或 4；脚本自动用梯度累积维持 `TOTAL_BATCH`。`LOSS_CHUNK_SIZE=512` 限制单个 logits 块，`MUON_BUCKET_MB=128` 将大专家组拆桶并逐桶通信/更新。这两个设置以显存为优先，不保证更高吞吐。最小桶还受完整矩阵和 rank 对齐约束，128 MiB 不是整个优化器的硬显存上限。
+\[
+\frac{df}{dx} \approx \frac{f(x+h) - f(x-h)}{2h} \qquad \text{error } O(h^2)
+\]
 
-默认关闭 FP8；先取得 BF16 基线，再在支持的 GPU 上以 `FP8=1` 单独验证数值与速度。路由专家仍使用 BF16，未接入 grouped GEMM 或 expert parallelism。`NO_COMPILE=1` 可用于定位编译问题；无 FA3 时可先用 `WINDOW_PATTERN=L` 测试，注意这会改变模型窗口配置。
+Finite differences are meaningless in float32 (roundoff swamps the signal), so `tests/test_scratch.py` flips the engine to float64 for those checks via `nanochat.scratch.tensor.set_dtype`.
 
-模型 checkpoint 保持兼容；旧优化器 checkpoint 恢复须使用原 `MUON_BUCKET_MB`（旧版为 0），不能直接套用新桶布局。每个保存点的权重与全部优化器分片合计约 60GB，需为多次保存预留空间。数据恢复仍为 row-group 级近似恢复，并非逐 token 精确重放。正式训练前建议至少做数百步稳定性实验，依据 `val/bpb`、step time、显存峰值决定预算；不能仅按激活参数套用稠密模型缩放定律。
+Verification layers, weakest to strongest:
 
-### 可选 DeepSeek 风格 MLA
+1. **op forward values** against closed-form numpy expressions (49 ops)
+2. **op gradients** against central finite differences
+3. **whole-model gradients** against finite differences — dense, MoE, and MoE with `norm_topk_prob`, covering the top-k gather, the expert-order sort and the scatter-add combine
+4. **optimizer steps** against hand-written reference updates (AdamW matches the textbook update to `rtol=1e-9` over 5 steps)
+5. **it learns**: the loss reaches the known entropy floor and the model does the arithmetic correctly
 
-默认仍为 GQA。设置 `ATTENTION_TYPE=mla` 可启用 Multi-head Latent Attention：KV 联合低秩压缩、解耦 RoPE、可选 Q 低秩投影；latent RMSNorm 使用可训练权重并归入 AdamW。实现位于 `nanochat/mla.py`，参考 [DeepSeek 官方 MLA](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py)。
-
-| 操作 | 命令 |
-|---|---|
-| MLA 参数预检查 | `ATTENTION_TYPE=mla bash runs/moe7b.sh check` |
-| MLA 冒烟训练 | `ATTENTION_TYPE=mla bash runs/moe7b.sh smoke` |
-| MLA 正式训练 | `ATTENTION_TYPE=mla bash runs/moe7b.sh train` |
-| 从 MLA checkpoint 做 SFT | `ATTENTION_TYPE=mla bash runs/moe7b.sh sft` |
-| MLA 评测 | `ATTENTION_TYPE=mla bash runs/moe7b.sh eval` |
-
-默认模型标签自动改为 `moe7b-mla`，避免与 GQA 混用。默认 `Q_LORA_RANK=0`（直接投影 Q）、`KV_LORA_RANK=512`、`QK_NOPE_HEAD_DIM=128`、`QK_ROPE_HEAD_DIM=64`、`V_HEAD_DIM=128`。如需压缩 Q，可设置 `Q_LORA_RANK=512`。也可直接给 `scripts.base_train` 传 `--attention-type=mla`、`--q-lora-rank`、`--kv-lora-rank`、`--qk-nope-head-dim`、`--qk-rope-head-dim`、`--v-head-dim`；这些架构字段随 checkpoint 保存，SFT/推理自动恢复。
-
-训练和首段 prefill 将 latent 展开为各头 K/V，使用 PyTorch SDPA；后续单 token 或多 token 续写使用吸收形式：Q 非位置部分乘 K 上投影权重，与缓存 latent 做 attention；先对 latent 加权汇总，再做 V 上投影。持久缓存只保存 `[layers, batch, length, kv_lora_rank]` 和 `[layers, batch, length, rope_dim]`，不保存或重建历史各头 K/V。支持因果/滑窗、前缀复制到多个采样行、reset、容量校验；仅支持批内统一位置的推理缓存，不支持 ragged continuous batching。
-
-默认 24 层配置下，BF16 的每 token、每行缓存（不含少量位置/smear 状态）：GQA 为 `24 × 2 × 4 × 128 × 2 = 49152` 字节，MLA 为 `24 × (512+64) × 2 = 27648` 字节，减少 **43.75%**。这仅是持久 KV 容量；吸收式参考实现会两次使用 latent，并有 attention scores 等临时张量，不能把容量降低直接等同于带宽或延迟提升。`check` 在 CPU 默认 FP32，显示的字节数会翻倍，并打印实际 compute dtype。
-
-兼容性与限制：
-- MLA 禁用原 GQA 的 Value Embedding 和完整 Q/K head norm，使用 latent norm 与 `(nope_dim+rope_dim)^(-1/2)` scale，以保持投影吸收成立；保留 nanochat 的 RoPE 方向/基频，不包含 DeepSeek 的 YaRN 扩展。其他 MoE、smear/backout、loss 分块和激活重计算不变。
-- 默认 MLA 总参数约 **7.133B**（32768 词表），含 LM head 的激活矩阵约 **1.494B**；切换后参数量和默认 token 预算会变化，不应继续套用 GQA 的精确统计。
-- **GQA checkpoint 不能直接当 MLA checkpoint 恢复**，也不支持直接导入官方 DeepSeek 权重。旧 GQA checkpoint 缺失这些字段时继续使用 GQA；切换 MLA 需要新训练或另行做转换/蒸馏。
-- 首版 MLA 注意力不参与本地 FP8 Linear 转换；`--fp8` 仍可作用于其他符合条件的层。尚未接入 FlashMLA、专用 Triton kernel、分页 KV 或张量并行。SDPA 能否选择高效 CUDA kernel 取决于硬件、维度和 mask；带滑窗的训练可能退回较慢路径。先测小模型数值和真实 GPU 显存/吞吐，再长跑。
-
-### 可选 MTP 训练与投机解码
-
-首版采用**单步、token 条件化的轻量 MTP 头**：`norm(h_t)` 与下一 token 的 embedding 拼接，经 `2d→d` 融合投影和残差 ReLU² MLP，使用共享 LM head 预测 `x_(t+2)`。这是本项目的辅助草稿头，不是 DeepSeek/HY3 的完整 Transformer MTP 层；没有额外的 MTP attention cache，也没有多层草稿树。
-
-默认关闭，使用 `MTP=1` 或 `scripts.base_train --mtp` 开启。默认辅助权重 0.1，可通过 `MTP_LOSS_WEIGHT` / `--mtp-loss-weight` 调整。训练目标为 `CE + MoE_aux + weight*MTP_CE`，MTP 梯度同时进入共享主干、embedding、LM head 和草稿头。行内移位后才展平，沿用 SFT 的 target mask；两步中任意一步为忽略位置或跨 BOS 边界时不计 MTP loss。分块损失会对整个草稿分支重计算；无有效辅助标签时返回图连接的零。评估以及 `loss_reduction='none'/'sum'` 不加入 MTP loss，BPB 和 RL 逐 token loss 不变。
-
-| 操作 | 命令 |
-|---|---|
-| GQA+MTP 预检查 | `MTP=1 bash runs/moe7b.sh check` |
-| MLA+MTP 预检查 | `ATTENTION_TYPE=mla MTP=1 bash runs/moe7b.sh check` |
-| 冒烟 / 正式预训练 | `MTP=1 bash runs/moe7b.sh smoke` / `MTP=1 bash runs/moe7b.sh train` |
-| SFT，继续训练已有 MTP 头 | `MTP=1 bash runs/moe7b.sh sft` |
-| 使用 SFT checkpoint 投机聊天 | `python -m scripts.chat_cli --model-tag=moe7b-mtp --speculative`（可配 `--temperature` / `--top-k`） |
-| 对比普通与投机解码 | `python -m scripts.infer_bench -i sft -g moe7b-mtp --speculative --prompt-tokens=512 --decode-tokens=128`（可加 `-t 0.8 -k 50`） |
-
-启用时默认标签为 `moe7b-mtp` 或 `moe7b-mla-mtp`；对 MLA 的后续操作同样设置 `ATTENTION_TYPE=mla`。SFT 自动加载并训练草稿头，可用 `--mtp-loss-weight=0` 禁用辅助目标（这不是冻结共享主干）。旧 checkpoint 没有 MTP 参数时仍可普通推理，但不能直接加 `--speculative`；也不能将旧 optimizer 原样恢复为新增草稿头的模型。当前不提供旧模型的自动头迁移，需要从 MTP 配置开始训练。SFT 保存完整 MTP 配置和权重；RL 的策略梯度没有 MTP 项，因此草稿头在 RL 中冻结（不进优化器）并原样保存。投机解码仍逐 token 验证、结果不变，但主干更新后接受率可能下降。
-
-解码过程：主头从当前前缀得到分布 `p`，采样（或 argmax）出 token `a`；MTP 根据该前缀隐藏态和 `a` 给出草稿分布 `q`，采样出 `b`；主干一次处理 `[a,b]`，用 `a` 位置的真实分布 `p'` 检验 `b`。接受则保留两个位置的缓存；拒绝则只保留 `a`，恢复 GQA/MLA 长度与 pre-smear embedding，下一步从纠正分布采样。草稿从不绕过主模型验证。工具表达式、强制工具结果及工具边界走普通逐 token 路径；只对已提交的 token 执行工具状态变更。
-
-**支持任意 temperature**：`temperature=0` 时 `p`、`q` 退化为 one-hot，接受条件即「草稿等于主头 argmax」，与之前的 greedy 行为逐 token 一致。`temperature>0` 使用标准投机采样（[Leviathan et al. 2023](https://arxiv.org/abs/2211.17192)、[Chen et al. 2023](https://arxiv.org/abs/2302.01318)）：以 `min(1, p'(b)/q(b))` 概率接受草稿，拒绝时从归一化残差 `norm(max(0, p'-q))` 采样纠正 token。由此**每个提交的 token 都是目标分布 `p'` 的精确样本**，不引入采样偏差。`top_k` 同时作用于主头和草稿分布。
-
-限制与性能：
-- 支持任意 `temperature >= 0` 与 `top_k`，但仍限制 `num_samples=1`、`model.eval()`；其他组合明确报错，普通采样不受影响。`max_tokens=None` 的投机路径使用训练上下文剩余长度作为预算。没有多 token 草稿树、continuous batching、CUDA Graph 或多 GPU 专用投机调度。
-- 保持输出**分布**一致，不保持 RNG 流：拒绝会多消耗随机数，因此相同 seed 下 `temperature>0` 的 token 序列与普通采样不同，只有 `temperature=0` 或 `top_k=1`（两个分布均为 one-hot）才逐 token 可复现。基准程序只在这两种情况下校验输出一致，不一致就不报告加速比。
-- 不同长度 GEMM/attention 的浮点舍入可能影响近似并列 argmax 以及接受判定，实际设备上应逐 token 对比。
-- `stats` 可记录草稿调用数、实际验证草稿数、接受数、验证调用数、主干处理 token 数、提交 token 数及强制 token 数。接受率是接受草稿数/验证草稿数，不含因工具边界跳过的提案；提交数包含终止标记和工具注入 token。基准按完整生成流计时，不把一次 yield 当成一次 GPU decode，也不套用普通解码 MFU/MBU 公式。
-- temperature 越高、`top_k` 越大，`p` 与 `q` 的重叠越低，接受率通常随之下降；是否仍有吞吐收益取决于训练后的接受率和硬件，不能因主干调用减少就保证加速。
-- 首版 MTP 训练与 `--fp8` 组合会提前报错：移位后的 token 数不满足当前 FP8 backward 对齐约束。先使用 BF16/FP32。
-- 宽度 2048 时新增约 41.94M 参数；普通目标模型推理 FLOPs 不包含未执行的草稿头，训练 FLOPs 会额外计算草稿头和第二次 LM-head 投影。token 数据预算仍按主干 active 参数决定，不把辅助标签计作额外训练 token。
-
-### Reproduce and talk to GPT-2
-
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+Plus two guards that keep the build honest: no source file may contain `import torch`, and `nanochat/scratch/` may import nothing but numpy and the standard library.
 
 ```bash
-bash runs/speedrun.sh
+pytest -m "not slow"   # 229 tests, ~5s
+pytest -m slow         # 2 real training runs, ~85s
 ```
 
-You may wish to do so in a screen session as this will take ~1.5 hours to run. Once it's done, you can talk to your model over the CLI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and chat:
+## Tokenizer
+
+`nanochat/bpe.py` is a hand-written byte-level BPE that handles both training and inference — no `rustbpe`, no `tiktoken`. It is the default and needs no extra dependencies.
+
+The Rust stack is still supported as an optional backend, because those two packages are the only way to *verify* the hand-written one:
 
 ```bash
-python -m scripts.chat_cli
+uv sync --extra fast-tokenizer     # installs rustbpe + tiktoken
+NANOCHAT_BPE_BACKEND=rust python -m scripts.tok_train
 ```
 
-Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :). An example conversation with a speedrun model:
-
-> **User:** Hello whats up?
->
-> **Assistant:** Hello! How can I help you today?
->
-> **User:** Why is the sky blue?
->
-> **Assistant:** The sky is blue due to an optical illusion called the Rayleigh Scattering of Light, which occurs when sunlight passes through tiny particles in the air. These particles are made up of tiny blue and violet particles that cause the light to bend in a particular way.
->
-> **User:** That's cool. Write a poem about it.
->
-> **Assistant:** In the twilight's glow, the sky is blue,<br>
-> A canvas of shimmering blue, where skies unfold,<br>
-> A world of blue, where blue and more blue,<br>
-> Are woven together in a tapestry so fine,<br>
-> Where every hue seems to sing a story.<br>
-> ...
-
-A few more notes:
-
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device-batch-size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
-- Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
-
-## Research
-
-If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:
-
-```
-OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=12 \
-    --run="d12" \
-    --model-tag="d12" \
-    --core-metric-every=999999 \
-    --sample-every=-1 \
-    --save-every=-1 \
-```
-
-This uses wandb (run name "d12"), only runs the CORE metric on last step, and it doesn't sample and save intermediate checkpoints. I like to change something in the code, re-run a d12 (or a d16 etc) and see if it helped, in an iteration loop. To see if a run helps, I like to monitor the wandb plots for:
-
-1. `val_bpb` (validation loss in vocab-size-invariant units of bits per byte) as a function of `step`, `total_training_time` and `total_training_flops`.
-2. `core_metric` (the DCLM CORE score)
-3. VRAM utilization, `train/mfu` (Model FLOPS utilization), `train/tok_per_sec` (training throughput)
-
-See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
-
-The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
-
-## Running on CPU / MPS
-
-The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
-
-## Precision / dtype
-
-nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
-
-| Hardware | Default dtype | Why |
-|----------|--------------|-----|
-| CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
-| CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
-| CPU / MPS | `float32` | Safe default. On recent macOS, MPS also runs `NANOCHAT_DTYPE=bfloat16` fine (~25% less memory, similar speed) |
-
-You can override the default with the `NANOCHAT_DTYPE` environment variable:
-
-```bash
-NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"   # force fp32
-NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # force bf16
-```
-
-How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
-
-Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too; RL does not and exits with an explicit error under fp16. Inference in fp16 works fine everywhere.
-
-## Guides
-
-I've published a number of guides that might contain helpful information, most recent to least recent:
-
-- [Feb 1 2026: Beating GPT-2 for <<$100: the nanochat journey](https://github.com/karpathy/nanochat/discussions/481)
-- [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) documents the first nanochat miniseries of models.
-- To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
-- [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
+`tests/test_bpe.py` asserts that our training produces the **same merge order** as rustbpe and that our encoder produces the **same token ids** as tiktoken on identical ranks. Without the extra, those tests skip and everything else works unchanged. Pure Python is roughly 100x slower to train and 6x slower to encode, which is why the fast backend remains available.
 
 ## File structure
 
 ```
 .
-├── LICENSE
-├── README.md
-├── dev
-│   ├── nanochat.png
-│   └── repackage_data_reference.py # Pretraining data shard generation
 ├── nanochat
-│   ├── __init__.py                 # empty
-│   ├── checkpoint_manager.py       # Save/Load model checkpoints
-│   ├── common.py                   # Misc small utilities, quality of life
-│   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
-│   ├── dataloader.py               # Tokenizing Distributed Data Loader
+│   ├── bpe.py                      # Hand-written byte-level BPE (training + inference)
+│   ├── common.py                   # Logging, base dir, locked download
 │   ├── dataset.py                  # Download/read utils for pretraining data
-│   ├── engine.py                   # Efficient model inference with KV Cache
-│   ├── execution.py                # Allows the LLM to execute Python code as tool
-│   ├── gpt.py                      # The GPT nn.Module Transformer
-│   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
-│   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   └── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
-├── pyproject.toml
-├── runs
-│   ├── miniseries.sh               # Miniseries training script
-│   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
+│   ├── execution.py                # Sandboxed Python execution (for the humaneval task)
+│   ├── scratch                     # The training stack, from scratch
+│   │   ├── data.py                 # Byte tokenizer + batch sampler
+│   │   ├── model.py                # The GPT architecture
+│   │   ├── nn.py                   # Module/Parameter system and layers
+│   │   ├── optim.py                # AdamW + Muon
+│   │   └── tensor.py               # Reverse-mode autograd engine
+│   └── tokenizer.py                # Tokenizer wrapper, GPT-4 style special tokens
 ├── scripts
-│   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
-│   ├── base_train.py               # Base model: train
-│   ├── chat_cli.py                 # Chat model: talk to over CLI
-│   ├── chat_eval.py                # Chat model: eval tasks
-│   ├── chat_rl.py                  # Chat model: reinforcement learning
-│   ├── chat_sft.py                 # Chat model: train SFT
-│   ├── infer_bench.py              # Inference: latency/throughput/VRAM bench
+│   ├── scratch_train.py            # Train a model end to end
 │   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
 │   └── tok_train.py                # Tokenizer: train it
-├── tasks
-│   ├── arc.py                      # Multiple choice science questions
-│   ├── common.py                   # TaskMixture | TaskSequence
-│   ├── gsm8k.py                    # 8K Grade School Math questions
-│   ├── humaneval.py                # Misnomer; Simple Python coding task
-│   ├── mmlu.py                     # Multiple choice questions, broad topics
-│   └── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
-├── tests
-│   ├── test_attention_fallback.py  # FA3/SDPA attention fallback
-│   ├── test_engine.py              # Inference engine, KV cache
-│   ├── test_execution.py           # Sandboxed code execution
-│   ├── test_optim.py               # MuonAdamW optimizer (needs GPU)
-│   ├── test_tasks.py               # Task slicing, mixtures, HubDataset
-│   └── test_tokenizer.py           # BPE round-trips, chat rendering
-└── uv.lock
+├── tasks                           # Eval task data loaders (arc, gsm8k, mmlu, ...)
+└── tests
+    ├── test_bpe.py                 # BPE training/encoding, rustbpe+tiktoken parity
+    ├── test_execution.py           # Sandboxed code execution
+    ├── test_scratch.py             # Autograd, layers, model, optimizers, convergence
+    ├── test_tasks.py               # Task slicing, mixtures, HubDataset
+    └── test_tokenizer.py           # BPE round-trips, chat rendering
 ```
 
-## Contributing
-
-The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~1.5 hours (down from 3h), but by improving the pretraining stage we can improve this further.
-
-Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand.
+`tasks/` and `nanochat/dataset.py` survive untouched — they are data plumbing (pyarrow, HTTP, sharding) and never depended on a framework. They currently have no consumer, since evaluating a model needs an inference engine that was part of the deleted stack.
 
 ## Acknowledgements
 
-- The name (nanochat) derives from my earlier project [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining.
-- nanochat is also inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified the nanoGPT repo with clear metrics and a leaderboard, and borrows a lot of its ideas and some implementation for pretraining.
-- Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
-- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
-- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
-- Thank you to the repo czar Sofie [@svlandeg](https://github.com/svlandeg) for help with managing issues, pull requests and discussions of nanochat.
-
-## Cite
-
-If you find nanochat helpful in your research cite simply as:
-
-```bibtex
-@misc{nanochat,
-  author = {Andrej Karpathy},
-  title = {nanochat: The best ChatGPT that \$100 can buy},
-  year = {2025},
-  publisher = {GitHub},
-  url = {https://github.com/karpathy/nanochat}
-}
-```
+This is a fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). All architecture ideas, the training recipe, and the tokenizer design are from upstream; this fork only reimplements them without a framework. The MoE layer follows DeepSeek-V2, Muon is from [Keller Jordan](https://kellerjordan.github.io/posts/muon/) with [Polar Express](https://arxiv.org/pdf/2505.16932) coefficients, and the speculative-decoding math is [Leviathan et al.](https://arxiv.org/abs/2211.17192).
 
 ## License
 

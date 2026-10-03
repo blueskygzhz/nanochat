@@ -1,5 +1,9 @@
 # Experiment Log
 
+> **Historical.** Every experiment below was run on the PyTorch GPU training stack,
+> which has been removed from this fork. Kept for the reasoning and results; none of
+> these runs can be reproduced here.
+
 A running summary documenting some experiments and findings. Started ~Jan 7 2026.
 
 ---

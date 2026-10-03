@@ -1,0 +1,660 @@
+"""
+Reverse-mode automatic differentiation, written from scratch on top of numpy.
+
+This is the from-scratch replacement for `torch.Tensor` + `torch.autograd` used by
+the `nanochat.scratch` package. Nothing in this package imports torch.
+
+numpy is used purely as an n-dimensional array with BLAS-backed matmul. It provides
+no autograd, no layers, no optimizers and no model -- all of that is written here.
+
+Design
+------
+Every `Tensor` produced by an operation remembers (a) its parent tensors and (b) a
+closure that knows how to push a gradient from the output back to those parents.
+`Tensor.backward()` walks the graph in reverse topological order and calls those
+closures. This is the classic micrograd design, with three additions that it takes
+to actually train a transformer:
+
+  1. Broadcasting is handled properly (`_unbroadcast`), so `(B,T,C) + (C,)` works
+     and the gradient is summed back down to `(C,)`.
+  2. Operations whose naive composition is numerically unstable are *fused* with a
+     hand-derived analytic backward: `softmax`, `cross_entropy`, `rms_norm`.
+  3. The scatter/gather ops a MoE router needs (`topk`, `index_add`, integer-array
+     indexing) propagate gradients correctly through duplicate indices.
+
+Everything is float32. There is no device concept: it is always CPU.
+"""
+
+import numpy as np
+
+__all__ = [
+    "Tensor", "no_grad", "is_grad_enabled", "set_dtype", "get_dtype",
+    "tensor", "zeros", "ones", "arange",
+    "cat", "stack", "softmax", "rms_norm", "cross_entropy",
+    "masked_fill", "topk", "index_add", "where",
+]
+
+
+# ----------------------------------------------------------------------------
+# global grad-enabled flag (the equivalent of torch.no_grad / torch.is_grad_enabled)
+
+_grad_enabled = True
+
+
+def is_grad_enabled():
+    return _grad_enabled
+
+
+class no_grad:
+    """Context manager *and* decorator that disables graph construction."""
+
+    def __enter__(self):
+        global _grad_enabled
+        self._prev = _grad_enabled
+        _grad_enabled = False
+        return self
+
+    def __exit__(self, *exc):
+        global _grad_enabled
+        _grad_enabled = self._prev
+        return False
+
+    def __call__(self, fn):
+        def wrapper(*args, **kwargs):
+            with no_grad():
+                return fn(*args, **kwargs)
+        wrapper.__name__ = getattr(fn, "__name__", "wrapped")
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+
+
+# ----------------------------------------------------------------------------
+# element type
+#
+# float32 is the training dtype. The switch exists because finite-difference
+# gradient checking is meaningless in float32: the roundoff floor
+# (eps * |f| / h) swamps the signal. Tests flip the engine to float64.
+
+_DTYPE = np.dtype(np.float32)
+
+
+def get_dtype():
+    return _DTYPE
+
+
+def set_dtype(dtype):
+    """Set the element type for all tensors created from here on."""
+    global _DTYPE
+    _DTYPE = np.dtype(dtype)
+
+
+# ----------------------------------------------------------------------------
+# helpers
+
+def _as_array(x):
+    if isinstance(x, np.ndarray):
+        return x.astype(_DTYPE, copy=False)
+    return np.asarray(x, dtype=_DTYPE)
+
+
+def _unbroadcast(grad, shape):
+    """Sum `grad` back down to `shape`, undoing numpy's broadcasting.
+
+    Broadcasting prepends length-1 axes and stretches existing length-1 axes, so the
+    adjoint is to sum over exactly those axes.
+    """
+    if grad.shape == shape:
+        return grad
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, s in enumerate(shape):
+        if s == 1 and grad.shape[i] != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+
+def _accumulate(t, g):
+    """Accumulate gradient `g` into tensor `t` (gradients add across fan-out)."""
+    if not t.requires_grad:
+        return
+    g = _unbroadcast(_as_array(g), t.data.shape)
+    if t.grad is None:
+        t.grad = np.zeros_like(t.data)
+    t.grad += g
+
+
+def _make(data, parents, op, backward):
+    """Build an output tensor, wiring the backward closure only if grad is needed."""
+    requires_grad = _grad_enabled and any(p.requires_grad for p in parents)
+    out = Tensor(data, requires_grad=requires_grad)
+    if requires_grad:
+        out._parents = parents
+        out._op = op
+        out._backward = backward
+    return out
+
+
+def _wrap(x):
+    return x if isinstance(x, Tensor) else Tensor(x)
+
+
+# ----------------------------------------------------------------------------
+
+class Tensor:
+    """A float32 n-d array that records how it was computed."""
+
+    def __init__(self, data, requires_grad=False):
+        self.data = _as_array(data)
+        self.requires_grad = bool(requires_grad)
+        self.grad = None
+        self._backward = None
+        self._parents = ()
+        self._op = "leaf"
+
+    # -- plumbing ------------------------------------------------------------
+
+    @property
+    def shape(self):
+        return self.data.shape
+
+    @property
+    def ndim(self):
+        return self.data.ndim
+
+    def size(self, dim=None):
+        return self.data.shape if dim is None else self.data.shape[dim]
+
+    def numel(self):
+        return self.data.size
+
+    def item(self):
+        return float(self.data.reshape(-1)[0])
+
+    def numpy(self):
+        return self.data
+
+    def detach(self):
+        """A tensor sharing the same buffer but cut off from the graph."""
+        return Tensor(self.data, requires_grad=False)
+
+    def zero_grad(self):
+        self.grad = None
+
+    def __repr__(self):
+        return f"Tensor(shape={self.data.shape}, requires_grad={self.requires_grad}, op={self._op})"
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    # -- backward pass -------------------------------------------------------
+
+    def backward(self, grad=None):
+        """Backpropagate from this tensor to every leaf that requires grad."""
+        if grad is None:
+            if self.data.size != 1:
+                raise RuntimeError("backward() on a non-scalar requires an explicit grad")
+            grad = np.ones_like(self.data)
+        if not self.requires_grad:
+            return
+
+        # Reverse topological order, built with an explicit stack so that deep graphs
+        # (many layers x many ops) cannot blow the Python recursion limit.
+        topo, visited = [], set()
+        stack = [(self, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                topo.append(node)
+                continue
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
+            stack.append((node, True))
+            for p in node._parents:
+                if id(p) not in visited:
+                    stack.append((p, False))
+
+        _accumulate(self, grad)
+        for node in reversed(topo):
+            if node._backward is not None and node.grad is not None:
+                node._backward(node.grad)
+
+    # -- elementwise binary --------------------------------------------------
+
+    def __add__(self, other):
+        other = _wrap(other)
+
+        def backward(g):
+            _accumulate(self, g)
+            _accumulate(other, g)
+        return _make(self.data + other.data, (self, other), "add", backward)
+
+    def __sub__(self, other):
+        other = _wrap(other)
+
+        def backward(g):
+            _accumulate(self, g)
+            _accumulate(other, -g)
+        return _make(self.data - other.data, (self, other), "sub", backward)
+
+    def __mul__(self, other):
+        other = _wrap(other)
+
+        def backward(g):
+            _accumulate(self, g * other.data)
+            _accumulate(other, g * self.data)
+        return _make(self.data * other.data, (self, other), "mul", backward)
+
+    def __truediv__(self, other):
+        other = _wrap(other)
+
+        def backward(g):
+            _accumulate(self, g / other.data)
+            _accumulate(other, -g * self.data / (other.data * other.data))
+        return _make(self.data / other.data, (self, other), "div", backward)
+
+    def __pow__(self, p):
+        if isinstance(p, Tensor):
+            raise NotImplementedError("tensor exponents are not supported")
+
+        def backward(g):
+            _accumulate(self, g * p * self.data ** (p - 1))
+        return _make(self.data ** p, (self,), "pow", backward)
+
+    def __neg__(self):
+        def backward(g):
+            _accumulate(self, -g)
+        return _make(-self.data, (self,), "neg", backward)
+
+    __radd__ = __add__
+    __rmul__ = __mul__
+
+    def __rsub__(self, other):
+        return _wrap(other) - self
+
+    def __rtruediv__(self, other):
+        return _wrap(other) / self
+
+    def __matmul__(self, other):
+        """Batched matmul. Both operands must be at least 2-D."""
+        other = _wrap(other)
+        if self.data.ndim < 2 or other.data.ndim < 2:
+            raise NotImplementedError("matmul requires both operands to be >= 2-D")
+
+        def backward(g):
+            _accumulate(self, g @ np.swapaxes(other.data, -1, -2))
+            _accumulate(other, np.swapaxes(self.data, -1, -2) @ g)
+        return _make(self.data @ other.data, (self, other), "matmul", backward)
+
+    # -- elementwise unary ---------------------------------------------------
+
+    def exp(self):
+        y = np.exp(self.data)
+
+        def backward(g):
+            _accumulate(self, g * y)
+        return _make(y, (self,), "exp", backward)
+
+    def log(self):
+        def backward(g):
+            _accumulate(self, g / self.data)
+        return _make(np.log(self.data), (self,), "log", backward)
+
+    def sqrt(self):
+        y = np.sqrt(self.data)
+
+        def backward(g):
+            _accumulate(self, g * 0.5 / y)
+        return _make(y, (self,), "sqrt", backward)
+
+    def rsqrt(self):
+        y = 1.0 / np.sqrt(self.data)
+
+        def backward(g):
+            _accumulate(self, g * -0.5 * y ** 3)
+        return _make(y, (self,), "rsqrt", backward)
+
+    def tanh(self):
+        y = np.tanh(self.data)
+
+        def backward(g):
+            _accumulate(self, g * (1.0 - y * y))
+        return _make(y, (self,), "tanh", backward)
+
+    def sigmoid(self):
+        # 0.5*(tanh(x/2)+1) == 1/(1+exp(-x)) but without the overflow for large |x|
+        y = 0.5 * (np.tanh(0.5 * self.data) + 1.0)
+
+        def backward(g):
+            _accumulate(self, g * y * (1.0 - y))
+        return _make(y, (self,), "sigmoid", backward)
+
+    def relu(self):
+        mask = self.data > 0
+
+        def backward(g):
+            _accumulate(self, g * mask)
+        return _make(np.where(mask, self.data, np.float32(0.0)), (self,), "relu", backward)
+
+    def square(self):
+        def backward(g):
+            _accumulate(self, g * 2.0 * self.data)
+        return _make(self.data * self.data, (self,), "square", backward)
+
+    def clamp_min(self, lo):
+        mask = self.data > lo
+
+        def backward(g):
+            _accumulate(self, g * mask)
+        return _make(np.maximum(self.data, np.float32(lo)), (self,), "clamp_min", backward)
+
+    # -- reductions ----------------------------------------------------------
+
+    def sum(self, axis=None, keepdims=False):
+        shape = self.data.shape
+
+        def backward(g):
+            if axis is not None and not keepdims:
+                g = np.expand_dims(g, axis)
+            _accumulate(self, np.broadcast_to(g, shape))
+        return _make(self.data.sum(axis=axis, keepdims=keepdims), (self,), "sum", backward)
+
+    def mean(self, axis=None, keepdims=False):
+        shape = self.data.shape
+        n = self.data.size if axis is None else int(np.prod([shape[a] for a in np.atleast_1d(axis)]))
+
+        def backward(g):
+            if axis is not None and not keepdims:
+                g = np.expand_dims(g, axis)
+            _accumulate(self, np.broadcast_to(g / n, shape))
+        return _make(self.data.mean(axis=axis, keepdims=keepdims), (self,), "mean", backward)
+
+    def max(self, axis=None, keepdims=False):
+        """Maximum over `axis`. Ties split the gradient evenly, matching torch.amax."""
+        m = self.data.max(axis=axis, keepdims=True)
+        mask = (self.data == m).astype(np.float32)
+        count = mask.sum(axis=axis, keepdims=True)
+
+        def backward(g):
+            if axis is not None and not keepdims:
+                g = np.expand_dims(g, axis)
+            _accumulate(self, mask * g / count)
+        return _make(self.data.max(axis=axis, keepdims=keepdims), (self,), "max", backward)
+
+    def var(self, axis=None, keepdims=False, unbiased=False):
+        mu = self.mean(axis=axis, keepdims=True)
+        d = self - mu
+        n = self.data.size if axis is None else int(np.prod([self.data.shape[a] for a in np.atleast_1d(axis)]))
+        s = (d * d).sum(axis=axis, keepdims=keepdims)
+        return s / float(n - 1 if unbiased else n)
+
+    def norm(self):
+        return (self * self).sum().sqrt()
+
+    # -- shape ---------------------------------------------------------------
+
+    def reshape(self, *shape):
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        old = self.data.shape
+
+        def backward(g):
+            _accumulate(self, g.reshape(old))
+        return _make(self.data.reshape(shape), (self,), "reshape", backward)
+
+    view = reshape
+
+    def permute(self, *axes):
+        if len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+            axes = tuple(axes[0])
+        inverse = tuple(np.argsort(axes))
+
+        def backward(g):
+            _accumulate(self, np.transpose(g, inverse))
+        return _make(np.transpose(self.data, axes), (self,), "permute", backward)
+
+    def swapaxes(self, a, b):
+        def backward(g):
+            _accumulate(self, np.swapaxes(g, a, b))
+        return _make(np.swapaxes(self.data, a, b), (self,), "swapaxes", backward)
+
+    transpose = swapaxes
+
+    @property
+    def mT(self):
+        """Transpose of the last two dims (the torch `.mT` spelling)."""
+        return self.swapaxes(-1, -2)
+
+    def unsqueeze(self, axis):
+        old = self.data.shape
+
+        def backward(g):
+            _accumulate(self, g.reshape(old))
+        return _make(np.expand_dims(self.data, axis), (self,), "unsqueeze", backward)
+
+    def squeeze(self, axis=None):
+        old = self.data.shape
+
+        def backward(g):
+            _accumulate(self, g.reshape(old))
+        return _make(np.squeeze(self.data, axis=axis), (self,), "squeeze", backward)
+
+    def expand(self, *shape):
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        old = self.data.shape
+
+        def backward(g):
+            _accumulate(self, _unbroadcast(g, old))
+        return _make(np.broadcast_to(self.data, shape), (self,), "expand", backward)
+
+    def contiguous(self):
+        return self
+
+    def __getitem__(self, key):
+        old = self.data.shape
+        basic = all(isinstance(k, (int, slice, type(None), type(Ellipsis)))
+                    for k in (key if isinstance(key, tuple) else (key,)))
+
+        def backward(g):
+            z = np.zeros(old, dtype=_DTYPE)
+            if basic:
+                z[key] = g          # slices never repeat an element
+            else:
+                np.add.at(z, key, g)  # integer/boolean indexing can, so accumulate
+            _accumulate(self, z)
+        return _make(self.data[key], (self,), "getitem", backward)
+
+    # -- method spellings of the free functions ------------------------------
+
+    def softmax(self, axis=-1):
+        return softmax(self, axis)
+
+    def cat(self, others, axis=0):
+        return cat([self] + list(others), axis)
+
+
+# ----------------------------------------------------------------------------
+# constructors
+
+def tensor(data, requires_grad=False):
+    return Tensor(data, requires_grad=requires_grad)
+
+
+def zeros(*shape, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+        shape = tuple(shape[0])
+    return Tensor(np.zeros(shape, dtype=_DTYPE), requires_grad=requires_grad)
+
+
+def ones(*shape, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+        shape = tuple(shape[0])
+    return Tensor(np.ones(shape, dtype=_DTYPE), requires_grad=requires_grad)
+
+
+def arange(n, requires_grad=False):
+    return Tensor(np.arange(n, dtype=_DTYPE), requires_grad=requires_grad)
+
+
+# ----------------------------------------------------------------------------
+# multi-tensor ops
+
+def cat(tensors, axis=0):
+    tensors = list(tensors)
+    sizes = [t.data.shape[axis] for t in tensors]
+
+    def backward(g):
+        offset = 0
+        for t, s in zip(tensors, sizes):
+            idx = [slice(None)] * g.ndim
+            idx[axis] = slice(offset, offset + s)
+            _accumulate(t, g[tuple(idx)])
+            offset += s
+    out = np.concatenate([t.data for t in tensors], axis=axis)
+    return _make(out, tuple(tensors), "cat", backward)
+
+
+def stack(tensors, axis=0):
+    tensors = list(tensors)
+
+    def backward(g):
+        for i, t in enumerate(tensors):
+            _accumulate(t, np.take(g, i, axis=axis))
+    out = np.stack([t.data for t in tensors], axis=axis)
+    return _make(out, tuple(tensors), "stack", backward)
+
+
+def where(cond, a, b):
+    """Elementwise select. `cond` is a plain boolean ndarray (not differentiable)."""
+    a, b = _wrap(a), _wrap(b)
+    cond = np.asarray(cond, dtype=bool)
+
+    def backward(g):
+        _accumulate(a, g * cond)
+        _accumulate(b, g * ~cond)
+    return _make(np.where(cond, a.data, b.data), (a, b), "where", backward)
+
+
+def masked_fill(t, mask, value):
+    """Set entries where `mask` is True to `value`; gradient is blocked there."""
+    mask = np.asarray(mask, dtype=bool)
+
+    def backward(g):
+        _accumulate(t, g * ~mask)
+    return _make(np.where(mask, np.float32(value), t.data), (t,), "masked_fill", backward)
+
+
+# ----------------------------------------------------------------------------
+# fused ops with hand-derived backwards
+#
+# These three could be composed from the primitives above, but the composition
+# either overflows (softmax/cross_entropy on large logits) or materialises a lot
+# of intermediate graph for no reason (rms_norm). The analytic forms below are
+# both stable and much cheaper.
+
+def softmax(t, axis=-1):
+    """p = exp(x - max) / sum(exp(x - max));  dx = p * (g - sum(g*p))"""
+    x = t.data
+    e = np.exp(x - x.max(axis=axis, keepdims=True))
+    p = e / e.sum(axis=axis, keepdims=True)
+
+    def backward(g):
+        _accumulate(t, p * (g - (g * p).sum(axis=axis, keepdims=True)))
+    return _make(p, (t,), "softmax", backward)
+
+
+def rms_norm(t, eps=1e-6):
+    """y = x / sqrt(mean(x^2) + eps)
+
+    With r = (mean(x^2) + eps)^(-1/2) and d = x.shape[-1]:
+        dL/dx = r*g - (r^3 / d) * x * sum(g * x)
+    """
+    x = t.data
+    d = x.shape[-1]
+    r = 1.0 / np.sqrt((x * x).mean(axis=-1, keepdims=True) + eps)
+
+    def backward(g):
+        s = (g * x).sum(axis=-1, keepdims=True)
+        _accumulate(t, r * g - (r ** 3) * x * s / d)
+    return _make(x * r, (t,), "rms_norm", backward)
+
+
+def cross_entropy(logits, targets, ignore_index=-1, reduction="mean"):
+    """Softmax cross-entropy straight from logits (never materialises probabilities
+    in the forward), with `ignore_index` masking. dlogits = (softmax - onehot)."""
+    x = logits.data
+    if x.ndim != 2:
+        raise ValueError(f"cross_entropy expects (N, V) logits, got {x.shape}")
+    n, _ = x.shape
+    t = np.asarray(targets).reshape(-1).astype(np.int64)
+    if t.shape[0] != n:
+        raise ValueError("logits and targets disagree on N")
+
+    z = x - x.max(axis=-1, keepdims=True)
+    logp = z - np.log(np.exp(z).sum(axis=-1, keepdims=True))
+    valid = t != ignore_index
+    safe_t = np.where(valid, t, 0)
+    rows = np.arange(n)
+    nll = np.where(valid, -logp[rows, safe_t], _DTYPE.type(0.0))
+    count = max(int(valid.sum()), 1)
+
+    if reduction == "mean":
+        out = nll.sum() / count
+    elif reduction == "sum":
+        out = nll.sum()
+    elif reduction == "none":
+        out = nll
+    else:
+        raise ValueError(f"unknown reduction: {reduction}")
+
+    def backward(g):
+        p = np.exp(logp)
+        p[rows, safe_t] -= 1.0
+        p *= valid[:, None]
+        if reduction == "mean":
+            p *= _DTYPE.type(g) / count
+        elif reduction == "sum":
+            p *= _DTYPE.type(g)
+        else:
+            p *= np.asarray(g, dtype=_DTYPE).reshape(n, 1)
+        _accumulate(logits, p)
+    return _make(out, (logits,), "cross_entropy", backward)
+
+
+# ----------------------------------------------------------------------------
+# scatter / gather, needed by the MoE router
+
+def topk(t, k, axis=-1):
+    """Top-k values along `axis`, unsorted (equivalent to torch.topk(sorted=False)).
+
+    Returns `(values_tensor, indices_ndarray)`. Indices are discrete, so only the
+    values carry gradient -- exactly like torch.
+    """
+    x = t.data
+    idx = np.argpartition(-x, k - 1, axis=axis)
+    idx = np.take(idx, np.arange(k), axis=axis)
+    vals = np.take_along_axis(x, idx, axis=axis)
+    old = x.shape
+
+    def backward(g):
+        z = np.zeros(old, dtype=_DTYPE)
+        np.put_along_axis(z, idx, g, axis=axis)  # indices within a row are unique
+        _accumulate(t, z)
+    return _make(vals, (t,), "topk", backward), idx
+
+
+def index_add(shape, index, src):
+    """`zeros(shape).index_add_(0, index, src)`.
+
+    The adjoint of a scatter-add is a gather, which is what makes this the natural
+    way to combine expert outputs back into the token stream: a token that was sent
+    to k experts receives gradient from all k of them.
+    """
+    index = np.asarray(index)
+    out = np.zeros(shape, dtype=_DTYPE)
+    np.add.at(out, index, src.data)
+
+    def backward(g):
+        _accumulate(src, g[index])
+    return _make(out, (src,), "index_add", backward)

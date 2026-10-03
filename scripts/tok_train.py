@@ -5,7 +5,7 @@ In the style of GPT-4 tokenizer.
 import os
 import time
 import argparse
-import torch
+import numpy as np
 from nanochat.tokenizer import RustBPETokenizer
 from nanochat.common import get_base_dir
 from nanochat.dataset import parquets_iter_batched
@@ -84,8 +84,7 @@ for token_id in range(vocab_size):
         # tokens that are not valid standalone UTF-8 (e.g. the raw bytes >= 0x80)
         num_bytes = len(tokenizer.decode_single_token_bytes(token_id))
         token_bytes.append(num_bytes)
-token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
-token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-with open(token_bytes_path, "wb") as f:
-    torch.save(token_bytes, f)
+token_bytes = np.array(token_bytes, dtype=np.int32)
+token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.npy")
+np.save(token_bytes_path, token_bytes)
 print(f"Saved token_bytes to {token_bytes_path}")

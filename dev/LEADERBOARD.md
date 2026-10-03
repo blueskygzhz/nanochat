@@ -1,5 +1,11 @@
 # Leaderboard
 
+> **Not applicable to this fork.** The "Time-to-GPT-2" leaderboard requires the
+> PyTorch training stack (8×H100, FlashAttention, FP8, distributed training), all of
+> which was removed from this fork. The CORE evaluation and `runs/speedrun.sh` no
+> longer exist here. This file is kept as upstream reference only — see
+> [karpathy/nanochat](https://github.com/karpathy/nanochat) to actually participate.
+
 Docs on participating in the "Time-to-GPT-2" leaderboard of nanochat.
 
 The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. Originally in 2019, GPT-2 was trained by OpenAI on 32 TPU v3 chips for 168 hours (7 days), with $8/hour/TPUv3 back then, for a total cost of approx. $43K. It achieves 0.256525 CORE score, which is an ensemble metric introduced in the DCLM paper over 22 evaluations like ARC/MMLU/etc. (To re-verify this baseline yourself: `base_eval.py` used to support evaluating HuggingFace models via `--hf-path openai-community/gpt2-xl`, removed for simplicity; see commit `21a7774` or earlier.)

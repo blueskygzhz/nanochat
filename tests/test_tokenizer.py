@@ -54,7 +54,9 @@ def test_encode_special_rejects_ordinary_tokens(tokenizer):
 
 
 def test_special_token_colliding_with_ordinary_token_is_rejected():
-    import tiktoken
+    # Uses tiktoken on purpose: the footgun being guarded against is tiktoken's
+    # encode_single_token preferring an ordinary token with identical bytes.
+    tiktoken = pytest.importorskip("tiktoken", reason="optional extra: fast-tokenizer")
     ranks = {bytes([i]): i for i in range(256)}
     ranks[b"<|bos|>"] = 256 # an ordinary token with the same bytes as a special token
     enc = tiktoken.Encoding(name="collide", pat_str=r"\S+|\s+", mergeable_ranks=ranks,
