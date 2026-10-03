@@ -18,10 +18,10 @@ parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the mod
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
-parser.add_argument('--speculative', action='store_true', help='use trained MTP head; requires --temperature=0')
+parser.add_argument('--speculative', action='store_true', help='use the trained MTP head to draft tokens (any temperature)')
 args = parser.parse_args()
-if args.speculative and args.temperature != 0:
-    parser.error('--speculative currently requires --temperature=0')
+if args.temperature < 0:
+    parser.error('--temperature must be non-negative')
 
 # Init the model and tokenizer
 

@@ -52,13 +52,13 @@ def weight_bytes(model):
     """Bytes of parameters as stored (each decode step reads all of them)."""
     return sum(p.numel() * p.element_size() for p in model.parameters())
 
-def bench_generate(engine, prompt_tokens, batch_size, decode_tokens, temperature):
+def bench_generate(engine, prompt_tokens, batch_size, decode_tokens, temperature, top_k=None):
     """Run one timed generation. Returns dict of measurements."""
     device = engine.model.get_device()
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
 
-    generator = engine.generate(prompt_tokens, num_samples=batch_size,
+    generator = engine.generate(prompt_tokens, num_samples=batch_size, top_k=top_k,
                                 max_tokens=decode_tokens, temperature=temperature)
     # The first next() runs the batch=1 prefill, the KV cache replication to
     # batch_size rows, and samples the first token: that is the TTFT.
@@ -81,7 +81,7 @@ def bench_generate(engine, prompt_tokens, batch_size, decode_tokens, temperature
     peak_vram = torch.cuda.max_memory_allocated(device)
     return dict(ttft=ttft, step_times=step_times, peak_vram=peak_vram)
 
-def bench_speculative(engine, prompt_tokens, decode_tokens, speculative):
+def bench_speculative(engine, prompt_tokens, decode_tokens, speculative, temperature=0.0, top_k=None, seed=42):
     """Time the whole stream, not per-yield latency (accepted drafts arrive in bursts)."""
     device = engine.model.get_device()
     cuda = device.type == 'cuda'
@@ -92,8 +92,8 @@ def bench_speculative(engine, prompt_tokens, decode_tokens, speculative):
     stats, output, masks = {}, [], []
     start = time.perf_counter()
     first_time = None
-    for column, mask in engine.generate(prompt_tokens, max_tokens=decode_tokens, temperature=0,
-                                       speculative=speculative, stats=stats):
+    for column, mask in engine.generate(prompt_tokens, max_tokens=decode_tokens, temperature=temperature,
+                                       top_k=top_k, seed=seed, speculative=speculative, stats=stats):
         output.append(column[0])
         masks.append(mask[0])
         if first_time is None:
@@ -131,12 +131,14 @@ def main():
     parser.add_argument("--decode-tokens", type=int, default=256, help="Tokens to generate per row")
     parser.add_argument("--batch-sizes", type=str, default="1,8,32,128", help="Comma-separated decode batch sizes")
     parser.add_argument("-t", "--temperature", type=float, default=0.0)
-    parser.add_argument("--speculative", action="store_true", help="compare single-row greedy MTP decoding with baseline (ignores batch sweep)")
+    parser.add_argument("-k", "--top-k", type=int, default=0, help="top-k sampling (0 = disabled)")
+    parser.add_argument("--speculative", action="store_true", help="compare single-row MTP speculative decoding with baseline (ignores batch sweep)")
     args = parser.parse_args()
-    if args.speculative and args.temperature != 0:
-        parser.error('--speculative requires temperature=0')
+    if args.temperature < 0:
+        parser.error('temperature must be non-negative')
     if args.decode_tokens < 1 or args.prompt_tokens < 1:
         parser.error('prompt-tokens and decode-tokens must be positive')
+    top_k = args.top_k or None
 
     device_type = autodetect_device_type()
     assert device_type == "cuda", "infer_bench currently assumes a CUDA GPU (for timing and VRAM measurement)"
@@ -156,17 +158,26 @@ def main():
         print(f"note: clamping prompt to {prompt_len} tokens so prompt+decode fits sequence_len={config.sequence_len}")
     prompt_tokens = build_prompt(tokenizer, prompt_len)
     if args.speculative:
-        print('MTP comparison: single-row greedy; per-yield MFU/MBU are not applicable.')
+        # Only one-hot sampling (greedy, or top_k=1) is reproducible token-for-token. Speculative
+        # sampling preserves the output distribution, not the RNG stream, so the two streams differ.
+        exact = args.temperature == 0 or args.top_k == 1
+        sampling = dict(temperature=args.temperature, top_k=top_k)
+        print(f"MTP comparison: single row, temperature={args.temperature}, top_k={top_k}; "
+              f"{'outputs must match the baseline' if exact else 'distribution-equivalent, token streams differ'}; "
+              "per-yield MFU/MBU are not applicable.")
         for enabled in (False, True):
-            bench_speculative(engine, prompt_tokens, min(8, args.decode_tokens), enabled)
-        baseline = bench_speculative(engine, prompt_tokens, args.decode_tokens, False)
-        speculative = bench_speculative(engine, prompt_tokens, args.decode_tokens, True)
-        matched = (baseline['output_ids'] == speculative['output_ids'] and baseline['masks'] == speculative['masks'])
-        speedup = baseline['elapsed_sec'] / speculative['elapsed_sec'] if matched else None
-        print(json.dumps(dict(mode='mtp_greedy', source=args.source, model_config=meta['model_config'],
+            bench_speculative(engine, prompt_tokens, min(8, args.decode_tokens), enabled, **sampling)
+        baseline = bench_speculative(engine, prompt_tokens, args.decode_tokens, False, **sampling)
+        speculative = bench_speculative(engine, prompt_tokens, args.decode_tokens, True, **sampling)
+        matched = (baseline['output_ids'] == speculative['output_ids']
+                   and baseline['masks'] == speculative['masks']) if exact else None
+        # tokens/sec ratio, so an early stop in one run does not inflate the comparison
+        speedup = (speculative['tokens_per_sec'] / baseline['tokens_per_sec']) if matched is not False else None
+        print(json.dumps(dict(mode='mtp_speculative', source=args.source, model_config=meta['model_config'],
+                              temperature=args.temperature, top_k=top_k, exact_match_expected=exact,
                               outputs_match=matched, speedup=speedup, baseline=baseline, speculative=speculative)))
         compute_cleanup()
-        if not matched:
+        if matched is False:
             raise RuntimeError('Greedy output mismatch; inspect chunk-vs-single-token numerical differences before claiming speedup')
         return
 
@@ -229,14 +240,15 @@ def main():
         "prompt_tokens": prompt_len,
         "decode_tokens": args.decode_tokens,
         "temperature": args.temperature,
+        "top_k": top_k,
         "sweep": [],
     }
 
     # ------------------------------------------------------------------------
     # Prefill measurement: batch 1, a single decode step, so TTFT ~= prefill time.
     # Prefill is compute-bound, so MFU (not MBU) is its distance from the roofline.
-    bench_generate(engine, prompt_tokens, 1, 2, args.temperature) # warmup
-    prefill_result = bench_generate(engine, prompt_tokens, 1, 2, args.temperature)
+    bench_generate(engine, prompt_tokens, 1, 2, args.temperature, top_k) # warmup
+    prefill_result = bench_generate(engine, prompt_tokens, 1, 2, args.temperature, top_k)
     prefill_time = prefill_result["ttft"]
     prefill_mfu = 100 * model.estimate_prefill_flops(prompt_len) / prefill_time / peak_flops
     prefill_tok_per_sec = prompt_len / prefill_time
@@ -257,9 +269,9 @@ def main():
     print("-" * len(header))
     for batch_size in batch_sizes:
         # warmup (cublas autotune, allocator warm, attention kernels)
-        bench_generate(engine, prompt_tokens, batch_size, 8, args.temperature)
+        bench_generate(engine, prompt_tokens, batch_size, 8, args.temperature, top_k)
         # timed run
-        result = bench_generate(engine, prompt_tokens, batch_size, args.decode_tokens, args.temperature)
+        result = bench_generate(engine, prompt_tokens, batch_size, args.decode_tokens, args.temperature, top_k)
         step_times = result["step_times"]
         num_steps = len(step_times)
         if num_steps == 0:

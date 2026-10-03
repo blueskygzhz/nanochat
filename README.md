@@ -103,18 +103,22 @@ SFT 的 `--num-iterations=N` 精确执行 N 次优化器更新（与梯度累积
 | MLA+MTP 预检查 | `ATTENTION_TYPE=mla MTP=1 bash runs/moe7b.sh check` |
 | 冒烟 / 正式预训练 | `MTP=1 bash runs/moe7b.sh smoke` / `MTP=1 bash runs/moe7b.sh train` |
 | SFT，继续训练已有 MTP 头 | `MTP=1 bash runs/moe7b.sh sft` |
-| 使用 SFT checkpoint 投机聊天 | `python -m scripts.chat_cli --model-tag=moe7b-mtp --temperature=0 --speculative` |
-| 对比普通与投机解码 | `python -m scripts.infer_bench -i sft -g moe7b-mtp --speculative --prompt-tokens=512 --decode-tokens=128` |
+| 使用 SFT checkpoint 投机聊天 | `python -m scripts.chat_cli --model-tag=moe7b-mtp --speculative`（可配 `--temperature` / `--top-k`） |
+| 对比普通与投机解码 | `python -m scripts.infer_bench -i sft -g moe7b-mtp --speculative --prompt-tokens=512 --decode-tokens=128`（可加 `-t 0.8 -k 50`） |
 
 启用时默认标签为 `moe7b-mtp` 或 `moe7b-mla-mtp`；对 MLA 的后续操作同样设置 `ATTENTION_TYPE=mla`。SFT 自动加载并训练草稿头，可用 `--mtp-loss-weight=0` 禁用辅助目标（这不是冻结共享主干）。旧 checkpoint 没有 MTP 参数时仍可普通推理，但不能直接加 `--speculative`；也不能将旧 optimizer 原样恢复为新增草稿头的模型。当前不提供旧模型的自动头迁移，需要从 MTP 配置开始训练。SFT 保存完整 MTP 配置和权重；RL 的策略梯度没有 MTP 项，因此草稿头在 RL 中冻结（不进优化器）并原样保存。投机解码仍逐 token 验证、结果不变，但主干更新后接受率可能下降。
 
-解码过程：主头从当前前缀确定 token `a`，MTP 根据该前缀隐藏态和 `a` 提议 `b`；主干一次处理 `[a,b]`，用 `a` 位置的主头 argmax 检验 `b`。接受则保留两个位置的缓存；拒绝则只保留 `a`，恢复 GQA/MLA 长度与 pre-smear embedding，下一步使用主头纠正 token。草稿从不绕过主模型验证。工具表达式、强制工具结果及工具边界走普通逐 token 路径；只对已提交的 token 执行工具状态变更。
+解码过程：主头从当前前缀得到分布 `p`，采样（或 argmax）出 token `a`；MTP 根据该前缀隐藏态和 `a` 给出草稿分布 `q`，采样出 `b`；主干一次处理 `[a,b]`，用 `a` 位置的真实分布 `p'` 检验 `b`。接受则保留两个位置的缓存；拒绝则只保留 `a`，恢复 GQA/MLA 长度与 pre-smear embedding，下一步从纠正分布采样。草稿从不绕过主模型验证。工具表达式、强制工具结果及工具边界走普通逐 token 路径；只对已提交的 token 执行工具状态变更。
+
+**支持任意 temperature**：`temperature=0` 时 `p`、`q` 退化为 one-hot，接受条件即「草稿等于主头 argmax」，与之前的 greedy 行为逐 token 一致。`temperature>0` 使用标准投机采样（[Leviathan et al. 2023](https://arxiv.org/abs/2211.17192)、[Chen et al. 2023](https://arxiv.org/abs/2302.01318)）：以 `min(1, p'(b)/q(b))` 概率接受草稿，拒绝时从归一化残差 `norm(max(0, p'-q))` 采样纠正 token。由此**每个提交的 token 都是目标分布 `p'` 的精确样本**，不引入采样偏差。`top_k` 同时作用于主头和草稿分布。
 
 限制与性能：
-- 仅支持 `temperature=0`、`num_samples=1`、`model.eval()`；其他组合明确报错，普通采样不受影响。`max_tokens=None` 的投机路径使用训练上下文剩余长度作为预算。没有概率接受/拒绝采样、continuous batching、CUDA Graph 或多 GPU 专用投机调度。
-- 在相同主模型概率下保持 greedy 语义；不同长度 GEMM/attention 的浮点舍入可能影响近似并列 argmax，实际设备上应逐 token 对比。基准程序检查输出与 mask 相同，若不一致就不报告加速比。
+- 支持任意 `temperature >= 0` 与 `top_k`，但仍限制 `num_samples=1`、`model.eval()`；其他组合明确报错，普通采样不受影响。`max_tokens=None` 的投机路径使用训练上下文剩余长度作为预算。没有多 token 草稿树、continuous batching、CUDA Graph 或多 GPU 专用投机调度。
+- 保持输出**分布**一致，不保持 RNG 流：拒绝会多消耗随机数，因此相同 seed 下 `temperature>0` 的 token 序列与普通采样不同，只有 `temperature=0` 或 `top_k=1`（两个分布均为 one-hot）才逐 token 可复现。基准程序只在这两种情况下校验输出一致，不一致就不报告加速比。
+- 不同长度 GEMM/attention 的浮点舍入可能影响近似并列 argmax 以及接受判定，实际设备上应逐 token 对比。
 - `stats` 可记录草稿调用数、实际验证草稿数、接受数、验证调用数、主干处理 token 数、提交 token 数及强制 token 数。接受率是接受草稿数/验证草稿数，不含因工具边界跳过的提案；提交数包含终止标记和工具注入 token。基准按完整生成流计时，不把一次 yield 当成一次 GPU decode，也不套用普通解码 MFU/MBU 公式。
-- 首版 MTP 训练与 `--fp8` 组合会提前报错：移位后的 token 数不满足当前 FP8 backward 对齐约束。先使用 BF16/FP32。草稿头是否带来吞吐收益取决于训练后的接受率和硬件，不能因主干调用减少就保证加速。
+- temperature 越高、`top_k` 越大，`p` 与 `q` 的重叠越低，接受率通常随之下降；是否仍有吞吐收益取决于训练后的接受率和硬件，不能因主干调用减少就保证加速。
+- 首版 MTP 训练与 `--fp8` 组合会提前报错：移位后的 token 数不满足当前 FP8 backward 对齐约束。先使用 BF16/FP32。
 - 宽度 2048 时新增约 41.94M 参数；普通目标模型推理 FLOPs 不包含未执行的草稿头，训练 FLOPs 会额外计算草稿头和第二次 LM-head 投影。token 数据预算仍按主干 active 参数决定，不把辅助标签计作额外训练 token。
 
 ### Reproduce and talk to GPT-2

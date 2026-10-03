@@ -1,4 +1,4 @@
-"""MTP supervision and single-draft greedy speculative decoding regressions."""
+"""MTP supervision and single-draft speculative decoding (greedy and sampling) regressions."""
 import copy
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from nanochat import checkpoint_manager, engine as engine_module, optim
-from nanochat.engine import Engine, KVCache, MLAKVCache
+from nanochat.engine import Engine, KVCache, MLAKVCache, residual_distribution, sampling_distribution
 from nanochat.gpt import GPT, GPTConfig
 from scripts.infer_bench import bench_speculative
 
@@ -331,19 +331,131 @@ def test_tools_execute_once_only_after_commit(attention, monkeypatch):
     assert calls == ['2+3']
 
 
-def test_speculative_requires_mtp_greedy_single_row_eval():
+def test_speculative_requires_mtp_single_row_eval():
     model = make_model(mtp=False).eval()
     with pytest.raises(ValueError, match='checkpoint'):
         list(Engine(model, Tokenizer()).generate([1, 2], temperature=0, speculative=True))
     model = make_model().eval()
     engine = Engine(model, Tokenizer())
     with pytest.raises(ValueError, match='temperature'):
-        list(engine.generate([1, 2], temperature=0.7, speculative=True))
+        list(engine.generate([1, 2], temperature=-0.5, speculative=True))
     with pytest.raises(ValueError, match='num_samples'):
         list(engine.generate([1, 2], num_samples=2, temperature=0, speculative=True))
     model.train()
     with pytest.raises(ValueError, match='eval'):
         list(engine.generate([1, 2], temperature=0, speculative=True))
+
+
+def test_sampling_distribution_applies_temperature_and_top_k():
+    logits = torch.tensor([1.0, 3.0, 2.0, -1.0])
+    torch.testing.assert_close(sampling_distribution(logits, 1.0, None), F.softmax(logits, -1))
+    torch.testing.assert_close(sampling_distribution(logits, 0.5, None), F.softmax(logits / 0.5, -1))
+    torch.testing.assert_close(sampling_distribution(logits, 1.0, 99), F.softmax(logits, -1))
+    truncated = sampling_distribution(logits, 1.0, 2)
+    assert truncated[0] == 0 and truncated[3] == 0
+    torch.testing.assert_close(truncated[1:3], F.softmax(torch.tensor([3.0, 2.0]), -1))
+    greedy = sampling_distribution(logits, 0, None)
+    assert greedy[1] == 1.0 and greedy.sum() == 1.0
+
+
+@pytest.mark.parametrize('p_values,q_values', [
+    ([0.6, 0.3, 0.1], [0.1, 0.3, 0.6]),   # draft disagrees with the target
+    ([0.5, 0.5, 0.0], [0.0, 0.2, 0.8]),   # disjoint support on some tokens
+    ([0.2, 0.3, 0.5], [0.2, 0.3, 0.5]),   # identical: everything is accepted
+    ([0.2, 0.3, 0.5], [1.0, 0.0, 0.0]),   # degenerate draft, mostly rejected
+])
+def test_accept_reject_plus_residual_reproduces_target_distribution(p_values, q_values):
+    # q(x)*min(1, p/q) + P(reject) * norm(max(0, p-q)) must equal p exactly
+    p, q = torch.tensor(p_values), torch.tensor(q_values)
+    accept = torch.clamp(p / q.clamp_min(1e-30), max=1.0)
+    committed = q * accept + (q * (1 - accept)).sum() * residual_distribution(p, q)
+    torch.testing.assert_close(committed, p)
+
+
+class FixedDistributionModel:
+    """Position-independent target/draft distributions, so every committed token is iid."""
+    training = False
+
+    def __init__(self, target_probs, draft_probs, attention='gqa'):
+        self.target_logits = torch.full((272,), -60.0)
+        self.draft_logits = torch.full((272,), -60.0)
+        for token, value in target_probs.items():
+            self.target_logits[token] = torch.tensor(value).log()
+        for token, value in draft_probs.items():
+            self.draft_logits[token] = torch.tensor(value).log()
+        self.config = SimpleNamespace(mtp_enabled=True, sequence_len=1024, attention_type=attention,
+                                      n_head=2, n_kv_head=1, n_embd=8, n_layer=1,
+                                      kv_lora_rank=4, qk_rope_head_dim=2)
+
+    def get_device(self):
+        return torch.device('cpu')
+
+    def embed_tokens(self, ids):
+        return ids.float().unsqueeze(-1).expand(-1, -1, 8)
+
+    def forward_with_hidden(self, ids, kv_cache):
+        logits = self.target_logits.expand(1, ids.size(1), -1).clone()
+        hidden = torch.zeros(1, ids.size(1), 8)
+        kv_cache.prev_embedding = self.embed_tokens(ids[:, -1:])
+        kv_cache.advance(ids.size(1))
+        return logits, hidden
+
+    def forward(self, ids, kv_cache=None):
+        return self.forward_with_hidden(ids, kv_cache)[0]
+
+    def mtp_logits(self, hidden, next_ids):
+        return self.draft_logits.expand(1, next_ids.size(1), -1).clone()
+
+
+@pytest.mark.parametrize('attention', ['gqa', 'mla'])
+def test_speculative_sampling_preserves_target_distribution(attention):
+    target = {10: 0.6, 11: 0.3, 12: 0.1}
+    draft = {10: 0.1, 11: 0.3, 12: 0.6} # deliberately disagrees, so drafts get rejected often
+    model = FixedDistributionModel(target, draft, attention)
+    engine = Engine(model, Tokenizer())
+    counts = {token: 0 for token in target}
+    total, accepted, proposed = 0, 0, 0
+    for seed in range(20):
+        stats = {}
+        tokens = [column[0] for column, _ in
+                  engine.generate([261], max_tokens=300, temperature=1.0, top_k=3, seed=seed,
+                                  speculative=True, stats=stats)]
+        assert len(tokens) == 300 and stats['generated_tokens'] == 300
+        for token in tokens:
+            counts[token] += 1
+        total += len(tokens)
+        accepted += stats['accepted_draft_tokens']
+        proposed += stats['draft_tokens']
+    assert 0 < accepted < proposed # both branches of the accept test are exercised
+    for token, probability in target.items():
+        assert abs(counts[token] / total - probability) < 0.03, (token, counts, total)
+
+
+def test_speculative_sampling_corrects_an_always_wrong_draft():
+    # q has disjoint support from p: every draft is rejected and the residual is exactly p
+    model = FixedDistributionModel({10: 0.7, 11: 0.3}, {12: 1.0})
+    engine = Engine(model, Tokenizer())
+    stats = {}
+    tokens = [column[0] for column, _ in
+              engine.generate([261], max_tokens=400, temperature=1.0, top_k=3, seed=7,
+                              speculative=True, stats=stats)]
+    assert stats['accepted_draft_tokens'] == 0 and stats['draft_tokens'] > 0
+    assert set(tokens) == {10, 11}
+    assert abs(tokens.count(10) / len(tokens) - 0.7) < 0.05
+
+
+@pytest.mark.parametrize('attention', ['gqa', 'mla'])
+def test_top_k_one_sampling_is_exactly_greedy(attention):
+    # top_k=1 makes both distributions one-hot, so sampling must reproduce greedy decoding
+    model = make_model(attention).eval()
+    engine = Engine(model, Tokenizer())
+    prompt = [10, 20, 30, 40]
+    greedy = list(engine.generate(prompt, max_tokens=14, temperature=0))
+    stats = {}
+    actual = list(engine.generate(prompt, max_tokens=14, temperature=1.0, top_k=1,
+                                  speculative=True, stats=stats))
+    assert actual == greedy
+    assert stats['draft_tokens'] > 0
 
 
 @pytest.mark.parametrize('terminal', [260, 261])
@@ -404,3 +516,14 @@ def test_speculative_benchmark_uses_whole_stream():
     assert result['stats']['target_calls'] == 3
     assert result['elapsed_sec'] >= result['ttft_sec'] > 0
     assert result['tokens_per_sec'] == 4 / result['elapsed_sec']
+
+
+def test_speculative_benchmark_passes_sampling_settings_through():
+    model = FixedDistributionModel({10: 0.6, 11: 0.4}, {11: 1.0})
+    result = bench_speculative(Engine(model, Tokenizer()), [261], 50, True, temperature=1.0, top_k=2, seed=3)
+    assert result['generated_tokens'] == 50
+    assert set(result['output_ids']) == {10, 11} # sampled, not collapsed to one token
+    assert 0 < result['acceptance_rate'] < 1
+    greedy = bench_speculative(Engine(model, Tokenizer()), [261], 20, True)
+    assert set(greedy['output_ids']) == {10} # temperature=0 still argmax-only
+    assert greedy['acceptance_rate'] == 0 # the draft always proposes the wrong token

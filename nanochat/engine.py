@@ -229,6 +229,34 @@ class MLAKVCache:
 
 
 # -----------------------------------------------------------------------------
+def sampling_distribution(logits, temperature, top_k):
+    """Dense 1-D distribution the sampler draws from, after temperature and top-k.
+
+    temperature=0 returns the degenerate one-hot argmax distribution, which makes
+    speculative sampling collapse to exact greedy verification.
+    """
+    logits = logits.detach().float().reshape(-1)
+    if temperature == 0:
+        probs = torch.zeros_like(logits)
+        probs[logits.argmax()] = 1.0
+        return probs
+    probs = F.softmax(logits / temperature, dim=-1)
+    if top_k is not None and 0 < top_k < probs.numel():
+        # identical to a softmax over the top-k logits, which is what sample_next_token does
+        values, idx = torch.topk(probs, top_k)
+        probs = torch.zeros_like(probs).scatter_(0, idx, values / values.sum())
+    return probs
+
+
+def residual_distribution(target_probs, draft_probs):
+    """norm(max(0, p - q)): the distribution a rejected draft token is replaced from."""
+    residual = (target_probs - draft_probs).clamp_min(0)
+    total = residual.sum()
+    if total <= 0:
+        return target_probs # p == q up to float noise: nothing left to correct towards
+    return residual / total
+
+
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
@@ -285,16 +313,20 @@ class Engine:
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42,
                  speculative=False, stats=None):
-        """Generate tokens; speculative mode uses one MTP proposal and exact greedy verification."""
+        """Generate tokens; speculative mode verifies one MTP proposal per step against the target."""
         assert isinstance(tokens, list) and tokens and isinstance(tokens[0], int), "expecting non-empty list of ints"
         if speculative:
-            if temperature != 0 or num_samples != 1:
-                raise ValueError('MTP speculative decoding supports only temperature=0 and num_samples=1')
+            if num_samples != 1:
+                raise ValueError('MTP speculative decoding supports only num_samples=1')
+            if temperature < 0:
+                raise ValueError('temperature must be non-negative')
             if not getattr(self.model.config, 'mtp_enabled', False):
                 raise ValueError('Speculative decoding requires a checkpoint trained with --mtp')
             if self.model.training:
                 raise ValueError('Speculative decoding requires model.eval()')
-            yield from self._generate_speculative(tokens, max_tokens, stats)
+            rng = torch.Generator(device=self.model.get_device())
+            rng.manual_seed(seed)
+            yield from self._generate_speculative(tokens, max_tokens, temperature, top_k, rng, stats)
             return
         if max_tokens is not None and max_tokens <= 0:
             return
@@ -365,8 +397,18 @@ class Engine:
             logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     @torch.inference_mode()
-    def _generate_speculative(self, tokens, max_tokens, stats):
-        """Verify [target token, one MTP proposal] together; never commit an unverified proposal."""
+    def _generate_speculative(self, tokens, max_tokens, temperature, top_k, rng, stats):
+        """Verify [target token, one MTP proposal] together; never commit an unverified proposal.
+
+        temperature=0 is exact greedy verification (accept iff the draft is the target argmax).
+        Otherwise this is speculative sampling (Leviathan et al. 2023 / Chen et al. 2023): the
+        draft b ~ q is accepted with probability min(1, p(b)/q(b)), and a rejection is replaced
+        by a draw from norm(max(0, p - q)), so every committed token is an exact sample of the
+        target distribution p. Note that this preserves the output *distribution*, not the RNG
+        stream: rejections consume extra randomness, so the token sequence does not match the
+        non-speculative sampler for the same seed (it does for temperature=0 or top_k=1, where
+        both distributions are one-hot).
+        """
         stats = {} if stats is None else stats
         stats.clear()
         stats.update(draft_calls=0, draft_tokens=0, accepted_draft_tokens=0, verification_calls=0,
@@ -375,6 +417,11 @@ class Engine:
         if budget <= 0:
             return
         device = self.model.get_device()
+        distribution = lambda logits: sampling_distribution(logits, temperature, top_k)
+        if temperature == 0:
+            draw = lambda probs: int(probs.argmax().item())
+        else:
+            draw = lambda probs: int(torch.multinomial(probs, 1, generator=rng).item())
         special = tuple(self.tokenizer.encode_special(s) for s in
                         ('<|python_start|>', '<|python_end|>', '<|output_start|>', '<|output_end|>', '<|assistant_end|>'))
         special = (*special, self.tokenizer.get_bos_token_id())
@@ -382,13 +429,13 @@ class Engine:
         cache = KVCache.from_config(self.model.config, 1, len(tokens) + budget, device, COMPUTE_DTYPE)
         prompt = torch.tensor([tokens], dtype=torch.long, device=device)
         logits, hidden = self.model.forward_with_hidden(prompt, kv_cache=cache)
-        logits, hidden = logits[:, -1:], hidden[:, -1:]
+        next_probs, hidden = distribution(logits[0, -1]), hidden[:, -1:]
         stats['target_calls'] += 1
         stats['target_tokens'] += len(tokens)
         state = RowState(tokens.copy())
         while stats['generated_tokens'] < budget and not state.completed:
             forced = bool(state.forced_tokens)
-            token = state.forced_tokens.popleft() if forced else logits[0, -1].argmax().item()
+            token = state.forced_tokens.popleft() if forced else draw(next_probs)
             state.commit(token, self.tokenizer, special)
             stats['generated_tokens'] += 1
             stats['forced_tokens'] += int(forced)
@@ -396,14 +443,16 @@ class Engine:
             if state.completed or stats['generated_tokens'] >= budget:
                 return
             ids = torch.tensor([[token]], dtype=torch.long, device=device)
-            draft = None
+            draft, draft_probs = None, None
             if not forced and not state.in_python_block and not state.forced_tokens and token not in tool_boundaries:
-                draft = self.model.mtp_logits(hidden, ids)[0, -1].argmax().item()
+                draft_probs = distribution(self.model.mtp_logits(hidden, ids)[0, -1])
+                draft = draw(draft_probs)
                 stats['draft_calls'] += 1
                 if draft in tool_boundaries:
                     draft = None
             if draft is None:
                 logits, hidden = self.model.forward_with_hidden(ids, kv_cache=cache)
+                next_probs, hidden = distribution(logits[0, -1]), hidden[:, -1:]
                 stats['target_calls'] += 1
                 stats['target_tokens'] += 1
                 continue
@@ -414,16 +463,19 @@ class Engine:
             stats['target_tokens'] += 2
             stats['verification_calls'] += 1
             stats['draft_tokens'] += 1
-            accepted = draft == verified_logits[0, 0].argmax().item()
+            target_probs = distribution(verified_logits[0, 0])
+            ratio = (target_probs[draft] / draft_probs[draft]).item()
+            # short circuits keep temperature=0 and hopeless drafts from consuming randomness
+            accepted = ratio >= 1.0 or (ratio > 0.0 and torch.rand((), generator=rng, device=device).item() < ratio)
             if accepted:
-                logits, hidden = verified_logits[:, 1:], verified_hidden[:, 1:]
+                next_probs, hidden = distribution(verified_logits[0, 1]), verified_hidden[:, 1:]
                 state.commit(draft, self.tokenizer, special)
                 stats['accepted_draft_tokens'] += 1
                 stats['generated_tokens'] += 1
                 yield [draft], [1]
             else:
                 cache.truncate(pos + 1, self.model.embed_tokens(ids))
-                logits, hidden = verified_logits[:, :1], verified_hidden[:, :1]
+                next_probs, hidden = residual_distribution(target_probs, draft_probs), verified_hidden[:, :1]
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
