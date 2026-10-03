@@ -192,6 +192,10 @@ NANOCHAT_BPE_BACKEND=rust python -m scripts.tok_train
 │   ├── chat_eval.py                # 4. Evaluate the chat model
 │   ├── chat_benchmarks.py          #    ARC/MMLU/GSM8K/HumanEval scoring for chat_eval --tasks
 │   ├── chat_cli.py                 # 5. Talk to it
+│   ├── chat_cai.py                 # post: SL-CAI (critique -> revision -> finetune)
+│   ├── chat_pm.py                  # post: preference models from AI feedback
+│   ├── chat_rl.py                  # post: PPO with KL penalty
+│   ├── posttrain_common.py         #       shared helpers for the three above
 │   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
 │   └── tok_train.py                # Tokenizer: train it (local file or parquet shards)
 ├── tasks                           # Eval task data loaders (arc, gsm8k, mmlu, ...)
@@ -199,12 +203,37 @@ NANOCHAT_BPE_BACKEND=rust python -m scripts.tok_train
     ├── test_benchmarks.py          # Benchmark scoring, offline (fake hub data, stub model)
     ├── test_bpe.py                 # BPE training/encoding, rustbpe+tiktoken parity
     ├── test_chat_format.py         # Chat layout, injection resistance, reply parsing
+    ├── test_rlhf.py                # PM loss, GAE, PPO clipping, KL rewards, CAI feedback
     ├── test_execution.py           # Sandboxed code execution
     ├── test_pipeline.py            # KV cache, engine, eval, checkpoints, tokenizers, chat
     ├── test_scratch.py             # Autograd, layers, model, optimizers, convergence
     ├── test_tasks.py               # Task slicing, mixtures, HubDataset
     └── test_tokenizer.py           # BPE round-trips, chat rendering
 ```
+
+## Post-training: Constitutional AI and RLHF
+
+`POSTTRAIN=1 bash runs/speedrun.sh` adds three stages after SFT, following the two papers in which Anthropic published its post-training recipe — *Training a Helpful and Harmless Assistant with RLHF* (arXiv:2204.05862) and *Constitutional AI* (arXiv:2212.08073). Anthropic has not published how any specific Claude model (3.x or later) was post-trained beyond saying it uses Constitutional AI and RLHF, plus the "character" variant described in *Claude's Character* (2024); those published methods are what is implemented.
+
+```bash
+python -m scripts.chat_cai --source sft --run cai          # SL-CAI: critique -> revision -> finetune
+python -m scripts.chat_pm  --source cai --run pm           # comparisons + AI feedback -> 2 preference models
+python -m scripts.chat_rl  --source cai --pm pm --run rl   # PPO on r_PM - lambda * KL(pi || pi_0)
+```
+
+| Paper | Here |
+|---|---|
+| Constitution: principles, each with a comparison question, a critique request and a revision request | `nanochat/constitution.py` |
+| SL-CAI: sample, critique and revise against a randomly drawn principle (repeatedly), finetune on revisions mixed with helpful data | `scripts/chat_cai.py` |
+| RL-CAI feedback: multiple-choice prompt, one random principle per comparison, soft labels from normalised `(A)`/`(B)` log-probs, optional 0.4–0.6 clamp for CoT labels | `LMFeedback.compare`, `chat_pm --clamp` |
+| PM: policy-family transformer + scalar head on the last token, Bradley-Terry loss (soft-label form) | `RewardModel`, `preference_loss` |
+| Robustness: two PMs on disjoint halves of the comparisons; optimise one, score with the other | `chat_pm` (train/test), `chat_rl` (PM-train / PM-test) |
+| RL: PPO with reward `r_PM − λ·KL(π‖π₀)`, π₀ = the SL-CAI model; reward vs √KL as the diagnostic | `chat_rl`, `kl_penalized_rewards`, `ppo_policy_loss`, `gae` |
+| Character training: self-ranked replies → preference model | `ranking_to_comparisons` feeds the same PM loss |
+
+**The judge is a stand-in.** The papers' feedback model is a large language model reading the conversation. A 230K-parameter model trained on addition cannot judge or revise anything, so by default (`--feedback rule`) each principle is checked and revised programmatically; every script says so in its output. `LMFeedback` implements the real prompt and soft labels (tested against a stub model) and is used with `--feedback lm:<run>` once there is a model capable of the job. Everything else — principle sampling, soft labels, PM, PPO — is identical either way.
+
+**What actually happens at this scale** (measured, default pipeline): SL-CAI fixes the few wrong answers on seen pairs (78 → 80/80; held-out 5 → 7/20). The PMs reach 0.79–0.90 accuracy on comparisons they never saw. PPO then has almost nothing left to improve — the SL-CAI policy already samples gold replies 94–99% of the time — and at the papers' λ_KL = 0.001 it does what the papers warn about: PM reward rises while gold accuracy collapses from 0.94 to 0.06 (the policy learns to answer "1" to everything), with PM-test rising too, because both PMs share the same blind spot. Hence `chat_rl` defaults to λ = 0.2, which holds gold accuracy at 0.94–1.00; the full sweep is in its docstring. That is the honest result: the machinery is the published one, and it reproduces the published failure mode, but at this scale RL does not make the model better.
 
 ## Standard benchmarks
 

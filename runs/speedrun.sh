@@ -74,12 +74,24 @@ banner "4/5  Evaluate the chat model"
 # CHAT_TASKS=all (or e.g. ARC-Easy,MMLU) adds the standard benchmarks; needs network
 "$PY" -m scripts.chat_eval --run sft ${CHAT_TASKS:+--tasks "$CHAT_TASKS" --max-problems 100}
 
+CHAT_RUN=sft
+if [[ "${POSTTRAIN:-0}" == "1" ]]; then
+    # Constitutional AI / RLHF post-training (Anthropic's published recipe), ~2 min
+    banner "post  SL-CAI: critique -> revision -> finetune"
+    "$PY" -m scripts.chat_cai --source sft --run cai
+    banner "post  Preference models from AI feedback"
+    "$PY" -m scripts.chat_pm --source cai --run pm --temperature 2.0
+    banner "post  PPO against the PM, KL-penalised"
+    "$PY" -m scripts.chat_rl --source cai --pm pm --run rl
+    CHAT_RUN=rl
+fi
+
 banner "5/5  Talk to it"
 for q in "2+3" "7+8" "9+9"; do
     printf 'You: %-5s Bot: ' "$q"
-    "$PY" -m scripts.chat_cli --run sft -p "$q"
+    "$PY" -m scripts.chat_cli --run "$CHAT_RUN" -p "$q"
 done
 
 banner "Done"
-echo "Interactive chat:  $PY -m scripts.chat_cli --run sft"
-echo "Checkpoints:       $NANOCHAT_BASE_DIR/checkpoints/{base,sft}"
+echo "Interactive chat:  $PY -m scripts.chat_cli --run $CHAT_RUN"
+echo "Checkpoints:       $NANOCHAT_BASE_DIR/checkpoints/"

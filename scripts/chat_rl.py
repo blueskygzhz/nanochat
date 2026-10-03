@@ -21,9 +21,25 @@ Logged every `--log-every` iterations, the quantities the papers use to read an 
     gold       the fraction of replies the constitution's checks actually accept
                (available only because the toy domain is checkable)
 
-`--kl-coef` defaults to the papers' 0.001. Everything else -- learning rates, clip,
-epochs, GAE lambda, the value function -- the papers do not specify; these are common
-PPO defaults, chosen to be stable at this scale.
+**On --kl-coef.** The papers use 0.001, with 52B-parameter preference models trained
+on ~10^5 comparisons. Here the PM is a 230K-parameter model trained on ~10^3, and at
+0.001 the policy finds its blind spots within 60 iterations: on the default run PM
+reward rises (1.78 -> 2.07) while the replies the constitution actually accepts fall
+from 94% to 6% -- the policy learns to answer "1" to everything. Measured sweep (same
+PM, 60 iterations; gold = replies passing every principle):
+
+    kl_coef   PM-train      gold          greedy seen / held-out
+    0.001     1.78 -> 2.07  0.94 -> 0.06  80 -> 1  /  7 -> 1
+    0.05      1.78 -> 1.82  0.94 -> 0.91  80 -> 70 /  7 -> 4
+    0.2       1.78 -> 1.79  0.94 -> 1.00  80 -> 78 /  7 -> 6
+
+So the default is 0.2; pass --kl-coef 0.001 to reproduce the papers' setting and watch
+over-optimisation happen. Note that PM-test rose along with PM-train in the 0.001 run:
+two PMs trained from the same initialisation on the same kind of data share blind spots,
+so at this scale only the gold check exposes the hacking.
+
+Everything else -- learning rates, clip, epochs, GAE lambda, the value function -- the
+papers do not specify; these are common PPO defaults.
 """
 
 import argparse
@@ -54,7 +70,8 @@ def parse_args():
     p.add_argument("--ppo-epochs", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=8)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--kl-coef", type=float, default=0.001, help="lambda_KL (papers: 0.001)")
+    p.add_argument("--kl-coef", type=float, default=0.2,
+                   help="lambda_KL. Papers: 0.001; see the docstring for why the default differs")
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--matrix-lr", type=float, default=0.001)

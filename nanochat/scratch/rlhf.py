@@ -186,9 +186,11 @@ def pad_sequences(seqs, pad_id):
     Right padding is safe for a causal model: no real position can see the padding.
     """
     lengths = [len(s) for s in seqs]
-    if min(lengths) < 2:
-        raise ValueError("every sequence needs at least 2 tokens")
-    out = np.full((len(seqs), max(lengths)), pad_id, dtype=np.int64)
+    if min(lengths) < 1:
+        raise ValueError("empty sequence")
+    # the model needs T >= 2 (the embedding smear reads the previous position);
+    # that applies to the padded batch, not to each row
+    out = np.full((len(seqs), max(max(lengths), 2)), pad_id, dtype=np.int64)
     for i, s in enumerate(seqs):
         out[i, :len(s)] = s
     return out, np.asarray(lengths) - 1
