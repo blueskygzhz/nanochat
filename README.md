@@ -52,7 +52,7 @@ The upstream project trains a GPT-2 capability model on an 8×H100 node in under
 - GPU training of any kind (no CUDA kernels)
 - distributed training (NCCL cannot be implemented in Python)
 - FlashAttention, FP8, bf16, `torch.compile`
-- MLA, MTP, and the 7.26B-total MoE run
+- MLA and the 7.26B-total MoE run (MTP has since been re-added, DeepSeek-V3 style)
 - GPT-2 / GPT-3 parity, the speedrun leaderboard
 
 What is left runs single-threaded float32 on CPU with naive O(T²) attention, so it is many orders of magnitude slower. Its demonstrated capability is a 229K-parameter model that, in ~2 minutes end-to-end, memorises the one-digit addition problems it was shown and solves 35–75% of held-out ones, depending on seed.
@@ -87,8 +87,16 @@ python -m scripts.chat_cli --run sft -p "3+4"    # single prompt, non-interactiv
 
 # Variants
 python -m scripts.base_train --n-routed-experts 4 --run moe   # MoE
+python -m scripts.base_train --n-mtp 2 --run mtp              # + multi-token prediction
 python -m scripts.base_train --text-file book.txt --run book  # any UTF-8 corpus
 ```
+
+With `--n-mtp D` the model trains D DeepSeek-V3 MTP modules (loss `L + λ/D·ΣL_k`), and
+`Engine` then decodes speculatively by default: the MTP chain drafts D tokens, one target
+forward verifies them, and the Leviathan et al. acceptance rule keeps the output
+distribution exactly the model's own — for greedy, any temperature and top-k, any draft
+temperature (`draft_temperature=`), and per-sample temperatures (`temperature=[0, 0.7, 1]`).
+`base_eval` reports the acceptance rate and checks greedy output is token-identical.
 
 `TOKENIZER=bpe bash runs/speedrun.sh` runs the whole thing with a BPE tokenizer trained on this README.
 
