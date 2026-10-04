@@ -21,6 +21,7 @@ from nanochat.scratch import (
     sample_next_token, save_checkpoint, setup_optimizer, token_bytes_table,
 )
 from nanochat.scratch import eval as seval
+from nanochat.scratch.tensor import no_grad
 from nanochat.tokenizer import tokenizer_spec
 
 
@@ -347,6 +348,231 @@ def test_use_calculator_evaluates_and_refuses():
     # anything that is not plain arithmetic must be refused, not evaluated
     for bad in ["__import__('os')", "open('x')", "2**999999", "a+b", "print(1)", ""]:
         assert use_calculator(bad) is None, bad
+
+
+# ----------------------------------------------------------------------------
+# per-row temperatures and speculative decoding with the MTP draft
+
+from nanochat.scratch.engine import speculative_accept, token_distribution  # noqa: E402
+
+
+def test_sample_next_token_accepts_one_temperature_per_row():
+    logits = np.array([[1.0, 5.0, 2.0], [9.0, 0.0, 1.0], [0.0, 0.0, 3.0]])
+    rows = sample_next_token(logits, np.random.default_rng(0), temperature=[0.0, 1.0, 0.0])
+    assert rows[0] == 1 and rows[2] == 2, "temperature-0 rows are greedy"
+    # a uniform scalar is the same as a list of it (same rng consumption)
+    a = sample_next_token(logits, np.random.default_rng(3), temperature=0.8, top_k=2)
+    b = sample_next_token(logits, np.random.default_rng(3), temperature=[0.8] * 3, top_k=2)
+    np.testing.assert_array_equal(a, b)
+    with pytest.raises(ValueError, match="one temperature per row"):
+        sample_next_token(logits, np.random.default_rng(0), temperature=[1.0, 1.0])
+    with pytest.raises(ValueError, match=">= 0"):
+        sample_next_token(logits, np.random.default_rng(0), temperature=-1.0)
+
+
+def test_token_distribution_is_one_hot_at_temperature_zero():
+    p = token_distribution(np.array([[0.1, 2.0, 1.0]]), 0.0)
+    np.testing.assert_array_equal(p, [[0.0, 1.0, 0.0]])
+    p = token_distribution(np.array([3.0, 1.0, 2.0, 0.0]), 1.0, top_k=2)
+    assert p[1] == 0 and p[3] == 0 and abs(p.sum() - 1) < 1e-12
+
+
+@pytest.mark.parametrize("case", ["random", "greedy_draft", "greedy_target", "equal", "disjoint"])
+def test_speculative_accept_emits_exactly_the_target_distribution(case):
+    """Monte Carlo over the acceptance rule: whatever q is, the first emitted token
+    must be distributed as p. A wrong residual (e.g. resampling from p on rejection)
+    biases the result towards the draft and fails this by a wide margin."""
+    rng = np.random.default_rng(0)
+    V = 6
+    p = rng.dirichlet(np.ones(V) * 0.7)
+    q = rng.dirichlet(np.ones(V) * 0.7)
+    if case == "greedy_draft":
+        q = np.eye(V)[np.argmax(q)]
+    elif case == "greedy_target":
+        p = np.eye(V)[2]
+    elif case == "equal":
+        q = p.copy()
+    elif case == "disjoint":
+        p = np.array([0.5, 0.5, 0, 0, 0, 0.0]); q = np.array([0, 0, 0.5, 0.5, 0, 0.0])
+    n = 60000
+    drafts = rng.choice(V, size=n, p=q)
+    counts = np.zeros(V)
+    accepted = 0
+    for x in drafts:
+        out, acc = speculative_accept(np.stack([p, p]), q[None], [x], rng)
+        counts[out[0]] += 1
+        accepted += acc
+    np.testing.assert_allclose(counts / n, p, atol=0.01)
+    # the acceptance rate is sum_x min(p, q) -- the overlap of the two distributions
+    np.testing.assert_allclose(accepted / n, np.minimum(p, q).sum(), atol=0.01)
+
+
+def test_speculative_accept_bonus_token_and_shapes():
+    rng = np.random.default_rng(0)
+    p = np.eye(4)[[1, 2, 3]]          # target is deterministic: 1, then 2, then 3
+    out, acc = speculative_accept(p, np.eye(4)[[1, 2]], [1, 2], rng)
+    assert (out, acc) == ([1, 2, 3], 2), "all accepted -> bonus from the last row"
+    out, acc = speculative_accept(p, np.eye(4)[[1, 0]], [1, 0], rng)
+    assert (out, acc) == ([1, 2], 1), "second draft rejected -> replaced by the target"
+    out, acc = speculative_accept(p[:1], np.zeros((0, 4)), [], rng)
+    assert (out, acc) == ([1], 0), "no drafts == an ordinary sampling step"
+    with pytest.raises(ValueError, match="d\\+1"):
+        speculative_accept(p, np.eye(4)[[1]], [1, 2], rng)
+
+
+class _TinyTok:
+    """Just enough tokenizer for the engine: a padding id."""
+    def get_bos_token_id(self):
+        return 0
+
+
+def _spec_model(n_mtp=2, vocab=265, seq=48, n_layer=2, scale=0.3, **kw):
+    config = GPTConfig(n_layer=n_layer, n_head=4, n_kv_head=2, n_embd=32, sequence_len=seq,
+                       vocab_size=vocab, n_mtp=n_mtp, **kw)
+    model = GPT(config)
+    rng = np.random.default_rng(1)
+    for p in model.parameters():    # zero-init projections would make every path trivial
+        if p.data.ndim == 2 and not p.data.any():
+            p.data = (rng.standard_normal(p.data.shape) * scale).astype(np.float32)
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize("kw", [
+    dict(n_mtp=1), dict(n_mtp=2), dict(n_mtp=3),
+    dict(n_mtp=2, n_routed_experts=4, n_shared_experts=1),
+], ids=["mtp1", "mtp2", "mtp3", "mtp2-moe"])
+def test_speculative_greedy_decoding_is_identical_to_plain_greedy(kw, tokenizer):
+    """At temperature 0 speculation may only change speed, never a single token --
+    including when drafts are cut short by max_tokens and the context end."""
+    model = _spec_model(**kw)
+    engine = Engine(model, tokenizer)
+    for prompt in ([256, 51, 43, 52, 61], list(range(60, 90))):
+        room = model.config.sequence_len - len(prompt)
+        plain = engine.generate_batch(prompt, max_tokens=room, temperature=0.0, speculative=False)
+        spec = engine.generate_batch(prompt, max_tokens=room, temperature=0.0)
+        assert spec == plain
+        s = engine.spec_stats
+        assert s["emitted"] == room and 0 <= s["accepted"] <= s["drafted"]
+
+
+def test_speculative_decoding_accepts_drafts_when_the_draft_agrees():
+    """Make the MTP draft agree with the target by construction: zero the main model's
+    blocks so the next token depends only on the current token, then give the target
+    a fixed successor table that the MTP head can reproduce exactly. Every draft is
+    accepted, so each round yields n_mtp + 1 tokens."""
+    model = _spec_model(n_mtp=2, vocab=16, seq=40, scale=0.0)
+    V = 16
+    with no_grad():
+        succ = (np.arange(V) * 5 + 3) % V        # t -> succ[t], a permutation
+        # main model: logits(next) = big * onehot(succ[t]) via embeddings & head
+        E = np.eye(V, 32)[:, :32] * 6.0
+        model.wte.weight.data = E.astype(np.float32)
+        for b in model.h:
+            b.attn.c_proj.weight.data[:] = 0
+            b.mlp.c_proj.weight.data[:] = 0
+        model.smear_lambda.data[:] = 0
+        model.x0_lambdas.data[:] = 0
+        model.resid_lambdas.data[:] = 1
+        model.backout_lambda.data[:] = 0
+        head = np.zeros((V, 32))
+        head[succ, np.arange(V)] = 60.0
+        model.lm_head.weight.data = head.astype(np.float32)
+        # MTP depth k: input [h ; emb(t_{i+k})] -> pass the token embedding through
+        for m in model.mtp:
+            m.proj.weight.data = np.concatenate([np.zeros((32, 32)), np.eye(32)], axis=1).astype(np.float32)
+            m.block.attn.c_proj.weight.data[:] = 0
+            m.block.mlp.c_proj.weight.data[:] = 0
+    engine = Engine(model, _TinyTok())
+    prompt = [1, 2]
+    out = engine.generate_batch(prompt, max_tokens=30, temperature=0.0)[0]
+    want = []
+    t = prompt[-1]
+    for _ in range(30):
+        t = int(succ[t]); want.append(t)
+    assert out == want
+    s = engine.spec_stats
+    assert s["drafted"] > 0 and s["accepted"] == s["drafted"], s
+    assert s["rounds"] <= 30 // 3 + 1, "each round should yield n_mtp + 1 tokens"
+    assert engine.acceptance_rate == 1.0
+
+
+def _exact_joint(model, prompt, n, temperature, top_k):
+    """P(t1..tn | prompt) by enumeration, from plain full forwards."""
+    V = model.config.vocab_size
+    seqs = [()]
+    probs = np.array([1.0])
+    for _ in range(n):
+        idx = np.array([list(prompt) + list(s) for s in seqs])
+        with no_grad():
+            logits = model(idx).data[:, -1]
+        p = token_distribution(logits, temperature, top_k)
+        probs = (probs[:, None] * p).reshape(-1)
+        seqs = [s + (t,) for s in seqs for t in range(V)]
+    return probs.reshape((V,) * n)
+
+
+@pytest.mark.parametrize("temperature,top_k,draft_temperature", [
+    (1.0, None, None), (0.7, 4, None), (1.0, None, 0.0), (1.3, None, 0.5),
+], ids=["T1", "T0.7-topk4", "T1-greedy-draft", "T1.3-draft0.5"])
+def test_speculative_sampling_matches_the_target_distribution(temperature, top_k, draft_temperature):
+    """End to end through the real caches: three generated tokens from speculative
+    decoding must follow the exact joint distribution of the plain model, for any
+    temperature/top-k and any (even mismatched) draft temperature."""
+    model = _spec_model(n_mtp=2, vocab=6, seq=8, n_layer=1, scale=0.6)
+    prompt = [1, 2]
+    exact = _exact_joint(model, prompt, 3, temperature, top_k)
+    engine = Engine(model, _TinyTok())
+    n = 3000
+    outs = engine.generate_batch(prompt, max_tokens=3, num_samples=n, temperature=temperature,
+                                 top_k=top_k, seed=0, draft_temperature=draft_temperature)
+    assert engine.spec_stats["drafted"] > 0
+    emp = np.zeros_like(exact)
+    for o in outs:
+        emp[tuple(o)] += 1.0 / n
+    for axis in range(3):     # each position's marginal, std <= 0.009 at n=3000
+        others = tuple(a for a in range(3) if a != axis)
+        np.testing.assert_allclose(emp.sum(axis=others), exact.sum(axis=others), atol=0.04)
+    np.testing.assert_allclose(emp.sum(axis=2), exact.sum(axis=2), atol=0.04)   # (t1, t2) pairs
+
+
+def test_speculative_mixed_per_row_temperatures(tokenizer):
+    model = _spec_model(n_mtp=2)
+    engine = Engine(model, tokenizer)
+    prompt = [256, 51, 43, 52, 61]
+    greedy = engine.generate_batch(prompt, max_tokens=12, temperature=0.0, speculative=False)[0]
+    rows = engine.generate_batch(prompt, max_tokens=12, num_samples=3,
+                                 temperature=[0.0, 1.0, 0.0], seed=3)
+    assert rows[0] == greedy and rows[2] == greedy
+    plain_rows = engine.generate_batch(prompt, max_tokens=12, num_samples=3,
+                                       temperature=[0.0, 1.0, 0.0], seed=3, speculative=False)
+    assert plain_rows[0] == greedy and plain_rows[2] == greedy
+
+
+def test_speculative_respects_stop_tokens(tokenizer):
+    model = _spec_model(n_mtp=3)
+    engine = Engine(model, tokenizer)
+    prompt = [256, 51, 43, 52, 61]
+    full = engine.generate_batch(prompt, max_tokens=20, temperature=0.0, speculative=False)[0]
+    stop = full[6]
+    first = full.index(stop)
+    out = engine.generate_batch(prompt, max_tokens=20, temperature=0.0, stop_tokens=[stop])[0]
+    assert out == full[:first + 1]
+
+
+def test_speculative_option_validation(tokenizer, tiny_model):
+    prompt = [256, 51, 43]
+    with pytest.raises(ValueError, match="MTP"):
+        list(Engine(tiny_model, tokenizer).generate(prompt, max_tokens=2, speculative=True))
+    with pytest.raises(ValueError, match="draft_temperature"):
+        list(Engine(tiny_model, tokenizer).generate(prompt, max_tokens=2, draft_temperature=0.0))
+    mtp = Engine(_spec_model(n_mtp=1), tokenizer)
+    with pytest.raises(ValueError, match="tool"):
+        list(mtp.generate(prompt, max_tokens=2, speculative=True, use_tools=True))
+    with pytest.raises(ValueError, match="one temperature per row"):
+        list(mtp.generate(prompt, max_tokens=2, num_samples=2, temperature=[1.0]))
+    # tools on an MTP model silently fall back to the plain path when not forced
+    assert len(mtp.generate_batch(prompt, max_tokens=3, temperature=0.0, use_tools=True)[0]) == 3
 
 
 # ----------------------------------------------------------------------------

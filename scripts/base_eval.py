@@ -96,6 +96,23 @@ def greedy_exact_match(engine, tokenizer, pairs):
     return correct
 
 
+def speculative_report(engine, tokenizer, pairs, max_tokens):
+    """For a model with MTP modules: how often greedy MTP drafts are accepted, and a
+    check that speculation changes nothing (greedy output must be token-identical)."""
+    drafted = accepted = rounds = emitted = 0
+    identical = True
+    for a, b in pairs:
+        ids = tokenizer.encode(f"{a}+{b}=", prepend="<|bos|>")
+        spec = engine.generate_batch(ids, max_tokens=max_tokens, temperature=0.0, speculative=True)
+        s = engine.spec_stats
+        drafted, accepted = drafted + s["drafted"], accepted + s["accepted"]
+        rounds, emitted = rounds + s["rounds"], emitted + s["emitted"]
+        plain = engine.generate_batch(ids, max_tokens=max_tokens, temperature=0.0, speculative=False)
+        identical &= spec == plain
+    return {"acceptance": accepted / max(drafted, 1), "tokens_per_forward": emitted / max(rounds + len(pairs), 1),
+            "identical": identical}
+
+
 def main():
     args = parse_args()
     checkpoints = os.path.join(get_base_dir(), "checkpoints", args.run)
@@ -152,6 +169,19 @@ def main():
         correct = greedy_exact_match(engine, tokenizer, pairs)
         print(f"{name:18s}{acc:10.3f}{f'{correct}/{len(pairs)}':>12s}")
     print("(MC chance is 0.500. Only the held-out row measures generalisation.)")
+
+    if getattr(model.config, "n_mtp", 0) > 0:
+        # A whole record "a+b=cc;<bos>a+b=..." fits in the budget, so drafts are tried
+        # both inside an answer and across the record boundary.
+        n_new = min(12, seq_len - 5)
+        print(f"\nspeculative decoding (n_mtp={model.config.n_mtp}, greedy, {n_new} tokens/prompt)")
+        for name, pairs in (("seen pairs", info["train_pairs"]), ("held-out pairs", info["heldout_pairs"])):
+            if not pairs:
+                continue
+            r = speculative_report(engine, tokenizer, pairs, n_new)
+            print(f"  {name:16s} acceptance {r['acceptance']:.3f} | "
+                  f"{r['tokens_per_forward']:.2f} tokens per target forward | "
+                  f"identical to plain greedy: {r['identical']}")
 
 
 if __name__ == "__main__":

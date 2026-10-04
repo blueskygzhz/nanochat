@@ -12,9 +12,13 @@ sequence- or batch-level balance loss attached through `AddAuxiliaryLoss`, SwiGL
 experts plus a fused shared expert, normal(0, initializer_range) expert init and a
 kaiming-uniform router. The dense FFN can be switched to SwiGLU via `hidden_act`.
 
+Multi-token prediction follows DeepSeek-V3 (`n_mtp` sequential modules sharing the
+embedding and head, loss weight lambda/D); `Engine` reuses the modules as the draft
+model for exact speculative decoding.
+
 Deliberately *not* mirrored, because they are properties of the GPU stack rather
 than of the model: FlashAttention (we use the naive O(T^2) form), FP8 matmuls,
-bf16 compute, torch.compile, activation checkpointing, MLA, and the MTP head.
+bf16 compute, torch.compile, activation checkpointing, and MLA.
 """
 
 from dataclasses import dataclass

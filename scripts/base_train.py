@@ -66,6 +66,9 @@ def parse_args():
     p.add_argument("--aux-loss-alpha", type=float, default=0.001)
     p.add_argument("--seq-aux", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--initializer-range", type=float, default=0.02, help="std of the expert init")
+    # multi-token prediction (DeepSeek-V3); the modules double as the speculative draft
+    p.add_argument("--n-mtp", type=int, default=0, help="MTP depth D (0 = off; V3 uses 1)")
+    p.add_argument("--mtp-loss-weight", type=float, default=0.3, help="lambda in L + lambda/D * sum L_k")
     # optimization
     p.add_argument("--num-iterations", type=int, default=400)
     p.add_argument("--batch-size", type=int, default=16, help="rows per micro-batch")
@@ -119,6 +122,7 @@ def derive_config(args, vocab_size):
         norm_topk_prob=args.norm_topk_prob, routed_scaling_factor=args.routed_scaling_factor,
         aux_loss_alpha=args.aux_loss_alpha, seq_aux=args.seq_aux,
         initializer_range=args.initializer_range,
+        n_mtp=args.n_mtp, mtp_loss_weight=args.mtp_loss_weight,
     )
 
 
@@ -220,19 +224,29 @@ def main():
         # matches one big batch rather than being grad_accum_steps times too large.
         # MoE balance losses are exempt, exactly as in DeepSeek: `add_aux_loss` gives
         # them gradient 1.0 per micro-batch regardless of this scaling.
+        # With MTP the returned loss is LM + lambda/D * sum(MTP); `total` logs the LM part
+        # alone so the curve is comparable with and without MTP.
         optimizer.zero_grad()
-        total = 0.0
+        total, mtp_total = 0.0, None
         for _ in range(args.grad_accum_steps):
             loss = model(*dataset.get_batch(args.batch_size, args.sequence_len, rng))
             (loss / args.grad_accum_steps).backward()
-            total += loss.item() / args.grad_accum_steps
+            parts = model.mtp_loss_values
+            lm = loss.item()
+            if parts:
+                lm -= config.mtp_loss_weight / len(parts) * sum(parts)
+                if mtp_total is None:
+                    mtp_total = np.zeros(len(parts))
+                mtp_total += np.array(parts) / args.grad_accum_steps
+            total += lm / args.grad_accum_steps
         optimizer.step()
 
         is_last = step == args.num_iterations - 1
         bpb = None  # evaluated at most once per step, then shared by log and checkpoint
         if (args.eval_every > 0 and step % args.eval_every == 0) or is_last:
             bpb = eval_bpb(model, dataset, token_bytes, args)
-            print(f"step {step:5d} | train {total:.4f} | val bpb {bpb:.4f} "
+            mtp_str = "" if mtp_total is None else " | mtp " + " ".join(f"{v:.4f}" for v in mtp_total)
+            print(f"step {step:5d} | train {total:.4f}{mtp_str} | val bpb {bpb:.4f} "
                   f"| lr x{scale:.2f} | {time.time() - t0:6.1f}s")
         if (args.save_every > 0 and step % args.save_every == 0) or is_last:
             if bpb is None:
