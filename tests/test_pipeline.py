@@ -517,6 +517,25 @@ def test_checkpoint_rebuilds_the_model_from_saved_config(tmp_path):
     assert loaded.num_parameters() == model.num_parameters()
 
 
+def test_checkpoint_from_before_swiglu_experts_still_loads(tmp_path):
+    """Old MoE checkpoints have relu^2 experts and no `moe_hidden_act` in their config."""
+    import glob
+    import json
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=16,
+                       vocab_size=64, n_routed_experts=2, moe_hidden_act="relu2")
+    model = GPT(config)
+    save_checkpoint(str(tmp_path), 0, model)
+    (meta_path,) = glob.glob(str(tmp_path / "**" / "meta.json"), recursive=True)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    del meta["config"]["moe_hidden_act"]
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
+    loaded, _ = load_model(str(tmp_path))
+    assert loaded.config.moe_hidden_act == "relu2"
+    assert loaded.num_parameters() == model.num_parameters()
+
+
 def test_checkpoint_round_trips_optimizer_state(tiny_model, tmp_path):
     """Resume is only correct if the momentum buffers come back too."""
     opt = setup_optimizer(tiny_model)

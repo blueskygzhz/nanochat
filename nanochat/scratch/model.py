@@ -3,8 +3,14 @@ nanochat's GPT, rebuilt on the from-scratch autograd engine.
 
 This mirrors the architecture in `nanochat/gpt.py` -- RMSNorm everywhere, RoPE with
 QK-norm, GQA, ResFormer value embeddings with a learned gate, embedding smear,
-per-layer residual/x0 scalars, mid-layer backout, ReLU-squared FFNs, DeepSeek-V2
-style MoE with a load-balancing auxiliary loss, and tanh-softcapped logits.
+per-layer residual/x0 scalars, mid-layer backout, ReLU-squared FFNs, and
+tanh-softcapped logits.
+
+The MoE layer follows DeepSeek-V2's reference `modeling_deepseek.py` exactly: softmax
+router, greedy or group-limited top-k, `norm_topk_prob` / `routed_scaling_factor`,
+sequence- or batch-level balance loss attached through `AddAuxiliaryLoss`, SwiGLU
+experts plus a fused shared expert, normal(0, initializer_range) expert init and a
+kaiming-uniform router. The dense FFN can be switched to SwiGLU via `hidden_act`.
 
 Deliberately *not* mirrored, because they are properties of the GPU stack rather
 than of the model: FlashAttention (we use the naive O(T^2) form), FP8 matmuls,
@@ -17,8 +23,11 @@ import numpy as np
 
 from nanochat.scratch import nn
 from nanochat.scratch.tensor import (
-    Tensor, cat, cross_entropy, get_dtype, index_add, no_grad, softmax, topk,
+    Tensor, add_aux_loss, cat, cross_entropy, get_dtype, index_add, no_grad, softmax, topk,
 )
+
+ACTIVATIONS = ("relu2", "silu")  # silu => SwiGLU (gate/up/down), as DeepSeek's hidden_act
+TOPK_METHODS = ("greedy", "group_limited_greedy")
 
 
 @dataclass
@@ -41,8 +50,31 @@ class GPTConfig:
     routed_scaling_factor: float = 1.0
     aux_loss_alpha: float = 0.001
     seq_aux: bool = True
+    scoring_func: str = "softmax"
+    topk_method: str = "greedy"         # V2-Lite: greedy; V2: group_limited_greedy
+    n_group: int = 1                    # V2: 8
+    topk_group: int = 1                 # V2: 3
+    moe_hidden_act: str = "silu"        # expert FFN; silu => SwiGLU, as DeepSeek
+    initializer_range: float = 0.02     # std of DeepSeek's normal init (experts)
+    # dense FFN
+    hidden_act: str = "relu2"           # nanochat; "silu" => DeepSeek's SwiGLU MLP
+    intermediate_size: int | None = None  # dense FFN width; None => 4 * n_embd
 
     def __post_init__(self):
+        for name in ("hidden_act", "moe_hidden_act"):
+            if getattr(self, name) not in ACTIVATIONS:
+                raise ValueError(f"{name} must be one of {ACTIVATIONS}")
+        if self.scoring_func != "softmax":
+            raise ValueError(f"unsupported scoring_func {self.scoring_func!r} (DeepSeek-V2: softmax)")
+        if self.topk_method not in TOPK_METHODS:
+            raise ValueError(f"topk_method must be one of {TOPK_METHODS}")
+        if self.n_routed_experts > 0 and self.topk_method == "group_limited_greedy":
+            if self.n_routed_experts % self.n_group:
+                raise ValueError("n_routed_experts must be divisible by n_group")
+            if not 1 <= self.topk_group <= self.n_group:
+                raise ValueError("topk_group must be in [1, n_group]")
+            if self.num_experts_per_tok > self.topk_group * (self.n_routed_experts // self.n_group):
+                raise ValueError("num_experts_per_tok exceeds the experts in topk_group groups")
         if self.n_embd % self.n_head:
             raise ValueError("n_embd must be divisible by n_head")
         if self.n_head % self.n_kv_head:
@@ -126,16 +158,35 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Dense FFN, also the body of every MoE expert."""
+    """Dense FFN, also the body of every MoE expert.
 
-    def __init__(self, config, intermediate_size=None):
+    act="relu2": nanochat's `c_proj(relu(c_fc(x))^2)`.
+    act="silu":  DeepSeek's `DeepseekV2MLP`, `down_proj(silu(gate_proj(x)) * up_proj(x))`,
+                 with the same parameter names.
+    """
+
+    def __init__(self, config, intermediate_size=None, act=None):
         super().__init__()
         hidden = 4 * config.n_embd if intermediate_size is None else intermediate_size
-        self.c_fc = nn.Linear(config.n_embd, hidden)
-        self.c_proj = nn.Linear(hidden, config.n_embd)
+        self.act = config.hidden_act if act is None else act
+        if self.act == "silu":
+            self.gate_proj = nn.Linear(config.n_embd, hidden)
+            self.up_proj = nn.Linear(config.n_embd, hidden)
+            self.down_proj = nn.Linear(hidden, config.n_embd)
+        else:
+            self.c_fc = nn.Linear(config.n_embd, hidden)
+            self.c_proj = nn.Linear(hidden, config.n_embd)
 
     def forward(self, x):
+        if self.act == "silu":
+            return self.down_proj(nn.swiglu(self.gate_proj(x), self.up_proj(x)))
         return self.c_proj(nn.relu_squared(self.c_fc(x)))
+
+    def in_projs(self):
+        return (self.gate_proj, self.up_proj) if self.act == "silu" else (self.c_fc,)
+
+    def out_proj(self):
+        return self.down_proj if self.act == "silu" else self.c_proj
 
 
 class MoEGate(nn.Module):
@@ -155,15 +206,32 @@ class MoEGate(nn.Module):
         self.seq_aux = config.seq_aux
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.topk_method = config.topk_method
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
         if not 1 <= self.top_k <= self.n_routed_experts:
             raise ValueError("top_k must be in [1, n_routed_experts]")
         self.weight = nn.Parameter(np.zeros((self.n_routed_experts, config.n_embd)))
 
     def forward(self, x):
         B, T, C = x.shape
-        flat = x.reshape(B * T, C)
+        N, E = B * T, self.n_routed_experts
+        flat = x.reshape(N, C)
         scores = softmax(flat @ self.weight.mT, axis=-1)          # (N, E)
-        topk_weight, topk_idx = topk(scores, self.top_k, axis=-1)  # (N, k)
+
+        if self.topk_method == "group_limited_greedy":
+            # Device-limited routing (DeepSeek-V2 sec. 2.2.2): experts are split into
+            # n_group contiguous groups, each scored by its best expert; only the top
+            # topk_group groups stay eligible. Masked scores become 0, so they never win
+            # and get no gradient -- the same as DeepSeek's masked_fill(..., 0.0).
+            group_scores = scores.data.reshape(N, self.n_group, -1).max(axis=-1)
+            group_idx = np.argpartition(-group_scores, self.topk_group - 1, axis=-1)[:, :self.topk_group]
+            group_mask = np.zeros_like(group_scores)
+            np.put_along_axis(group_mask, group_idx, 1.0, axis=-1)
+            score_mask = np.repeat(group_mask, E // self.n_group, axis=-1)   # (N, E)
+            topk_weight, topk_idx = topk(scores * score_mask, self.top_k, axis=-1)
+        else:
+            topk_weight, topk_idx = topk(scores, self.top_k, axis=-1)  # (N, k)
 
         if self.top_k > 1 and self.norm_topk_prob:
             topk_weight = topk_weight / (topk_weight.sum(axis=-1, keepdims=True) + 1e-20)
@@ -172,7 +240,6 @@ class MoEGate(nn.Module):
 
         aux_loss = None
         if self.training and self.alpha > 0.0:
-            E = self.n_routed_experts
             if self.seq_aux:
                 # Per-sequence balance: dispatch fraction within each sequence, averaged over batch
                 idx_per_seq = topk_idx.reshape(B, T * self.top_k)
@@ -192,20 +259,25 @@ class MoEGate(nn.Module):
 
 
 class MoE(nn.Module):
-    """DeepSeek-V2 style MoE: top-k routed experts plus optional always-on shared experts.
+    """DeepSeek-V2 MoE (`DeepseekV2MoE`): top-k routed experts plus always-on shared experts.
 
-    Like nanochat (and unlike DeepSeek's reference code) the auxiliary loss is stashed
-    on `self.aux_loss` and added to the main loss by `GPT.forward`, rather than being
-    injected through an autograd hack that hard-codes an incoming gradient of 1.0.
+    As in DeepSeek's reference code, the auxiliary loss is attached to the routed
+    output with `AddAuxiliaryLoss` (`add_aux_loss`): the forward is the identity, and
+    the backward injects a gradient of exactly 1.0 into the aux loss. So it is not part
+    of the returned loss value, it is optimised by any backward pass through this layer,
+    and it is *not* scaled down by `loss / grad_accum_steps`. `self.aux_loss` keeps the
+    value for logging.
     """
 
     def __init__(self, config):
         super().__init__()
         self.n_routed_experts = config.n_routed_experts
         inter = moe_intermediate_size(config)
-        self.experts = nn.ModuleList([MLP(config, inter) for _ in range(self.n_routed_experts)])
+        act = config.moe_hidden_act
+        self.experts = nn.ModuleList([MLP(config, inter, act) for _ in range(self.n_routed_experts)])
         self.gate = MoEGate(config)
-        self.shared_experts = (MLP(config, inter * config.n_shared_experts)
+        # n shared experts == one MLP n times as wide (the hidden units just concatenate)
+        self.shared_experts = (MLP(config, inter * config.n_shared_experts, act)
                                if config.n_shared_experts > 0 else None)
         self.aux_loss = None
 
@@ -213,6 +285,8 @@ class MoE(nn.Module):
         B, T, C = x.shape
         topk_idx, topk_weight, self.aux_loss = self.gate(x)
         y = self._dispatch(x.reshape(B * T, C), topk_idx, topk_weight).view(B, T, C)
+        if self.training and self.aux_loss is not None:
+            y = add_aux_loss(y, self.aux_loss)
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
         return y
@@ -245,7 +319,8 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MoE(config) if is_moe_layer(layer_idx, config) else MLP(config)
+        self.mlp = (MoE(config) if is_moe_layer(layer_idx, config)
+                    else MLP(config, config.intermediate_size))
 
     def forward(self, x, ve, cos_sin, window, kv_cache=None):
         x = x + self.attn(nn.norm(x), ve, cos_sin, window, kv_cache)
@@ -303,10 +378,12 @@ class GPT(nn.Module):
     def init_weights(self):
         """The whole initialisation scheme in one function, mirroring nanochat.
 
-        The two choices worth noticing: every output projection starts at exactly
-        zero (so each block is an identity map at step 0 and the residual stream is
-        clean), and `resid_lambdas`/`x0_lambdas` decay with depth so early layers
-        lean on the embedding and deep layers lean on the residual.
+        The two choices worth noticing: every attention and dense-FFN output
+        projection starts at exactly zero (so those sublayers are identity maps at
+        step 0 and the residual stream is clean), and `resid_lambdas`/`x0_lambdas`
+        decay with depth so early layers lean on the embedding and deep layers lean on
+        the residual. MoE layers instead use DeepSeek-V2's scheme: N(0, 0.02) experts
+        and a kaiming-uniform router.
 
         Every random draw comes from `self.seed`, so two models with the same config
         and seed are bit-identical and different seeds give independent inits.
@@ -328,20 +405,23 @@ class GPT(nn.Module):
                     0.0, 0.02, block.attn.ve_gate.weight.shape).astype(dt)
 
             if isinstance(block.mlp, MoE):
+                # DeepSeek's `_init_weights`: every expert Linear ~ N(0, initializer_range)
                 experts = list(block.mlp.experts)
                 if block.mlp.shared_experts is not None:
                     experts.append(block.mlp.shared_experts)
+                std = self.config.initializer_range
                 for expert in experts:
-                    expert.c_fc.weight.data = rng.uniform(
-                        -s * 0.4, s * 0.4, expert.c_fc.weight.shape).astype(dt)
-                    expert.c_proj.weight.data = np.zeros_like(expert.c_proj.weight.data)
-                # Router bound = 1/sqrt(fan_in), i.e. DeepSeek's kaiming_uniform_(a=sqrt(5))
+                    for lin in (*expert.in_projs(), expert.out_proj()):
+                        lin.weight.data = rng.normal(0.0, std, lin.weight.shape).astype(dt)
+                # The router is a bare Parameter, which `_init_weights` skips: it keeps
+                # kaiming_uniform_(a=sqrt(5)), i.e. Uniform(+-1/sqrt(fan_in))
                 block.mlp.gate.weight.data = rng.uniform(
                     -n_embd ** -0.5, n_embd ** -0.5, block.mlp.gate.weight.shape).astype(dt)
             else:
-                block.mlp.c_fc.weight.data = rng.uniform(
-                    -s * 0.4, s * 0.4, block.mlp.c_fc.weight.shape).astype(dt)
-                block.mlp.c_proj.weight.data = np.zeros_like(block.mlp.c_proj.weight.data)
+                for lin in block.mlp.in_projs():
+                    lin.weight.data = rng.uniform(-s * 0.4, s * 0.4, lin.weight.shape).astype(dt)
+                out = block.mlp.out_proj()
+                out.weight.data = np.zeros_like(out.weight.data)
 
         n_layer = self.config.n_layer
         denom = max(n_layer - 1, 1)
@@ -416,7 +496,11 @@ class GPT(nn.Module):
         return 15.0 * (self.lm_head(hidden) / 15.0).tanh()
 
     def collect_aux_loss(self):
-        """Sum of the MoE load-balancing losses from the most recent forward."""
+        """Sum of the MoE load-balancing losses from the most recent forward.
+
+        For logging only: the losses are already wired into the graph by
+        `add_aux_loss`, so adding this to the objective would count them twice.
+        """
         total = None
         for m in self.modules():
             if isinstance(m, MoE) and m.aux_loss is not None:
@@ -433,9 +517,8 @@ class GPT(nn.Module):
                              ignore_index=-1, reduction=loss_reduction)
         if loss_reduction == "none":
             loss = loss.reshape(B, T)  # (B, T) per-token losses, for bits-per-byte
-        aux = self.collect_aux_loss()
-        if aux is not None and loss_reduction == "mean":
-            loss = loss + aux
+        # As in DeepSeek, the returned loss is the LM loss only; the MoE balance losses
+        # reach the gradient through `add_aux_loss` inside each MoE layer.
         return loss
 
     # -- inference -----------------------------------------------------------

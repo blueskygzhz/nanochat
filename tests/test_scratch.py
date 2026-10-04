@@ -182,6 +182,7 @@ OPS = [
     ("tanh",              lambda a: a.tanh(),                       [(3, 4)], False),
     ("sigmoid",           lambda a: a.sigmoid(),                    [(3, 4)], False),
     ("relu_squared",      lambda a: snn.relu_squared(a),            [(3, 4)], False),
+    ("swiglu",            lambda a, b: snn.swiglu(a, b),            [(3, 4), (3, 4)], False),
     ("square",            lambda a: a.square(),                     [(3, 4)], False),
     ("sum_all",           lambda a: a.sum(),                        [(3, 4)], False),
     ("sum_axis",          lambda a: a.sum(axis=1),                  [(3, 4, 5)], False),
@@ -238,6 +239,25 @@ def test_softmax_is_a_probability_distribution(float64_engine):
     p = st.softmax(Tensor(np.random.default_rng(0).standard_normal((5, 9)) * 50), -1)
     np.testing.assert_allclose(p.data.sum(-1), 1.0, atol=1e-12)
     assert (p.data >= 0).all()
+
+
+def test_swiglu_forward_matches_closed_form(float64_engine):
+    _check_forward(lambda a, b: snn.swiglu(a, b), [(4, 5), (4, 5)],
+                   lambda a, b: a / (1.0 + np.exp(-a)) * b)
+
+
+def test_add_aux_loss_is_identity_forward_and_injects_unit_gradient(float64_engine):
+    """DeepSeek's AddAuxiliaryLoss: d(aux) is exactly 1, whatever scales the main loss."""
+    x = Tensor(np.arange(6.0).reshape(2, 3), requires_grad=True)
+    w = Tensor(np.array(2.0), requires_grad=True)
+    aux = w * 3.0
+    y = st.add_aux_loss(x, aux)
+    np.testing.assert_array_equal(y.data, x.data)
+    (y.sum() * 0.25).backward()
+    np.testing.assert_allclose(x.grad, 0.25)
+    np.testing.assert_allclose(w.grad, 3.0)  # 1.0 * d(aux)/dw, not scaled by 0.25
+    with pytest.raises(ValueError, match="scalar"):
+        st.add_aux_loss(x, x)
 
 
 def test_rms_norm_forward_matches_closed_form(float64_engine):
@@ -793,11 +813,22 @@ def test_zero_grad_clears_gradients():
 # ----------------------------------------------------------------------------
 # whole-model gradient check against finite differences
 
-def _finite_difference_check(config, n_probes=40, eps=1e-6, seed=0):
+def _finite_difference_check(config, n_probes=40, eps=1e-6, seed=0, randomize=False):
     rng = np.random.default_rng(seed)
     model = GPT(config)
+    if randomize:  # zero-init output projections hide most of the graph from the probe
+        for p in model.parameters():
+            if p.data.ndim == 2 and not p.data.any():
+                p.data = rng.standard_normal(p.data.shape) * 0.1
     x = rng.integers(0, config.vocab_size, (2, config.sequence_len))
     y = rng.integers(0, config.vocab_size, (2, config.sequence_len))
+
+    # With `add_aux_loss` the MoE balance losses get gradient 1.0 on top of the LM
+    # loss, so the function the backward differentiates is loss + sum(aux).
+    def objective():
+        loss = model(x, y)
+        aux = model.collect_aux_loss()
+        return loss.item() + (aux.item() if aux is not None else 0.0)
 
     loss = model(x, y)
     model.zero_grad()
@@ -811,9 +842,9 @@ def _finite_difference_check(config, n_probes=40, eps=1e-6, seed=0):
         original = p.data[idx]
 
         p.data[idx] = original + eps
-        plus = model(x, y).item()
+        plus = objective()
         p.data[idx] = original - eps
-        minus = model(x, y).item()
+        minus = objective()
         p.data[idx] = original
 
         numeric = (plus - minus) / (2 * eps)
@@ -843,6 +874,22 @@ def test_moe_gradients_with_norm_topk_prob(float64_engine):
                        vocab_size=16, n_routed_experts=4, num_experts_per_tok=3,
                        norm_topk_prob=True, seq_aux=False, aux_loss_alpha=0.02)
     _finite_difference_check(config, seed=2)
+
+
+def test_moe_gradients_with_group_limited_routing(float64_engine):
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, n_routed_experts=8, n_shared_experts=2,
+                       num_experts_per_tok=3, topk_method="group_limited_greedy",
+                       n_group=4, topk_group=2, routed_scaling_factor=16.0, aux_loss_alpha=0.01)
+    _finite_difference_check(config, seed=3)
+
+
+def test_swiglu_dense_and_relu2_expert_gradients(float64_engine):
+    """The two non-default activation pairings: SwiGLU dense FFN, relu^2 experts."""
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, hidden_act="silu", intermediate_size=40,
+                       n_routed_experts=3, num_experts_per_tok=2, moe_hidden_act="relu2")
+    _finite_difference_check(config, seed=4, randomize=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1020,10 +1067,9 @@ def test_moe_dispatch_equals_a_naive_per_token_loop(float64_engine):
                        vocab_size=16, n_routed_experts=4, num_experts_per_tok=2)
     model = GPT(config)
     moe = next(m for m in model.modules() if isinstance(m, MoE))
-    # zero-init c_proj would make every expert output 0, so randomize
     rng = np.random.default_rng(0)
     for e in moe.experts:
-        e.c_proj.weight.data = rng.standard_normal(e.c_proj.weight.shape) * 0.1
+        e.down_proj.weight.data = rng.standard_normal(e.down_proj.weight.shape) * 0.1
 
     x_flat = Tensor(rng.standard_normal((16, 24)))
     idx, weight, _ = moe.gate(Tensor(x_flat.data.reshape(2, 8, 24)))
@@ -1049,6 +1095,149 @@ def test_moe_gate_rejects_bad_top_k():
     with pytest.raises(ValueError, match="top_k"):
         GPT(GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
                       vocab_size=16, n_routed_experts=2, num_experts_per_tok=5))
+
+
+def _deepseek_v2_reference(x, W, experts, shared, cfg, training=True):
+    """Line-by-line numpy port of `MoEGate.forward` + the `DeepseekV2MoE.forward`
+    training path from deepseek-ai/DeepSeek-V2's modeling_deepseek.py."""
+    bsz, seq_len, h = x.shape
+    E, k = W.shape[0], cfg.num_experts_per_tok
+    logits = x.reshape(-1, h) @ W.T
+    scores = _np_softmax(logits, -1)
+    if cfg.topk_method == "greedy":
+        tmp = scores
+    else:
+        group_scores = scores.reshape(bsz * seq_len, cfg.n_group, -1).max(-1)
+        group_idx = np.argsort(-group_scores, -1)[:, :cfg.topk_group]
+        group_mask = np.zeros_like(group_scores)
+        np.put_along_axis(group_mask, group_idx, 1.0, -1)
+        score_mask = np.repeat(group_mask[:, :, None], E // cfg.n_group, -1).reshape(bsz * seq_len, -1)
+        tmp = np.where(score_mask.astype(bool), scores, 0.0)
+    topk_idx = np.argsort(-tmp, -1)[:, :k]
+    topk_weight = np.take_along_axis(tmp, topk_idx, -1)
+    if k > 1 and cfg.norm_topk_prob:
+        topk_weight = topk_weight / (topk_weight.sum(-1, keepdims=True) + 1e-20)
+    else:
+        topk_weight = topk_weight * cfg.routed_scaling_factor
+    aux = None
+    if training and cfg.aux_loss_alpha > 0:
+        ia = topk_idx.reshape(bsz, -1)
+        if cfg.seq_aux:
+            ce = np.zeros((bsz, E))
+            np.add.at(ce, (np.arange(bsz)[:, None], ia), 1.0)
+            ce /= seq_len * k / E
+            aux = (ce * scores.reshape(bsz, seq_len, -1).mean(1)).sum(1).mean() * cfg.aux_loss_alpha
+        else:
+            fi = np.eye(E)[ia.reshape(-1)].mean(0) * E
+            aux = (scores.mean(0) * fi).sum() * cfg.aux_loss_alpha
+    hs = np.repeat(x.reshape(-1, h), k, axis=0)              # repeat_interleave
+    flat = topk_idx.reshape(-1)
+    y = np.empty_like(hs)
+    for i, ex in enumerate(experts):
+        if (flat == i).any():
+            y[flat == i] = ex(Tensor(hs[flat == i])).data
+    y = (y.reshape(*topk_weight.shape, -1) * topk_weight[..., None]).sum(1).reshape(x.shape)
+    if shared is not None:
+        y = y + shared(Tensor(x)).data
+    return np.sort(topk_idx, -1), y, aux
+
+
+@pytest.mark.parametrize("kw", [
+    dict(),                                                           # V2-Lite
+    dict(norm_topk_prob=True, seq_aux=False),
+    dict(topk_method="group_limited_greedy", n_group=4, topk_group=2,
+         routed_scaling_factor=16.0),                                 # V2
+], ids=["v2-lite", "norm-topk-batch-aux", "v2-group-limited"])
+def test_moe_matches_deepseek_v2_reference(float64_engine, kw):
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, n_routed_experts=8, n_shared_experts=2,
+                       num_experts_per_tok=3, aux_loss_alpha=0.01, **kw)
+    moe = next(m for m in GPT(config).modules() if isinstance(m, MoE))
+    x = np.random.default_rng(0).standard_normal((3, 8, 24))
+    idx, _, aux = moe.gate(Tensor(x))
+    want_idx, want_y, want_aux = _deepseek_v2_reference(
+        x, moe.gate.weight.data, moe.experts, moe.shared_experts, config)
+    np.testing.assert_array_equal(np.sort(idx, -1), want_idx)
+    np.testing.assert_allclose(aux.item(), want_aux, rtol=1e-6)  # dispatch counts are fp32, as upstream
+    np.testing.assert_allclose(moe(Tensor(x)).data, want_y, atol=1e-10)
+    moe.eval()
+    np.testing.assert_allclose(moe(Tensor(x)).data, want_y, atol=1e-10)  # moe_infer path
+
+
+def test_group_limited_routing_stays_inside_the_chosen_groups():
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, n_routed_experts=12, num_experts_per_tok=4,
+                       topk_method="group_limited_greedy", n_group=6, topk_group=2)
+    moe = next(m for m in GPT(config).modules() if isinstance(m, MoE))
+    moe.gate.weight.data *= 20.0  # sharp scores, so plain greedy would cross groups
+    x = Tensor(np.random.default_rng(1).standard_normal((4, 8, 24)))
+    idx, _, _ = moe.gate(x)
+    assert all(len(set(row // 2)) <= 2 for row in idx), "a token used more than topk_group groups"
+    moe.gate.topk_method = "greedy"
+    greedy, _, _ = moe.gate(x)
+    assert any(len(set(row // 2)) > 2 for row in greedy), "setup failed: greedy never crosses"
+
+
+def test_aux_loss_gradient_ignores_main_loss_scaling():
+    """`loss / grad_accum_steps` must scale the LM gradient but not the balance loss,
+    exactly as DeepSeek's AddAuxiliaryLoss behaves."""
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, n_routed_experts=4, num_experts_per_tok=2,
+                       aux_loss_alpha=0.1)
+    model = GPT(config)
+    gate = next(m for m in model.modules() if isinstance(m, MoE)).gate
+    x = np.random.default_rng(0).integers(0, 16, (2, 8))
+
+    def gate_grad(scale, lm=True):
+        model.zero_grad()
+        loss = model(x, x)
+        (loss * scale if lm else model.collect_aux_loss()).backward()
+        return gate.weight.grad.copy()
+
+    aux_only = gate_grad(1.0, lm=False)
+    lm_only = gate_grad(1.0) - aux_only
+    np.testing.assert_allclose(gate_grad(0.25), 0.25 * lm_only + aux_only, rtol=1e-4, atol=1e-7)
+
+
+def test_returned_loss_excludes_aux_and_eval_attaches_nothing():
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, n_routed_experts=4, num_experts_per_tok=2,
+                       aux_loss_alpha=0.5)
+    model = GPT(config)
+    x = np.random.default_rng(0).integers(0, 16, (2, 8))
+    train_loss = model(x, x).item()
+    assert model.collect_aux_loss().item() > 0
+    model.eval()
+    assert model(x, x).item() == pytest.approx(train_loss, rel=1e-6)
+
+
+def test_moe_experts_use_deepseek_swiglu_and_init():
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=64, sequence_len=8,
+                       vocab_size=16, n_routed_experts=8, n_shared_experts=2)
+    model = GPT(config)
+    names = {n for n, _ in model.named_parameters()}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        assert f"h.1.mlp.experts.0.{proj}.weight" in names
+        assert f"h.1.mlp.shared_experts.{proj}.weight" in names
+    assert "h.0.mlp.c_fc.weight" in names, "dense layers keep nanochat's relu^2 by default"
+    moe = model.h[1].mlp
+    assert moe.shared_experts.up_proj.weight.shape == (2 * 48, 64)
+    w = np.concatenate([p.data.ravel() for n, p in moe.named_parameters() if "experts" in n])
+    assert abs(w.std() - config.initializer_range) < 1e-3 and abs(w.mean()) < 1e-3
+    assert np.abs(moe.gate.weight.data).max() <= 64 ** -0.5  # kaiming_uniform(a=sqrt(5))
+
+
+def test_moe_config_validation():
+    base = dict(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8, vocab_size=16,
+                n_routed_experts=8, num_experts_per_tok=2)
+    for kw in [dict(hidden_act="gelu"), dict(moe_hidden_act="tanh"), dict(scoring_func="sigmoid"),
+               dict(topk_method="noaux_tc"),
+               dict(topk_method="group_limited_greedy", n_group=3),
+               dict(topk_method="group_limited_greedy", n_group=4, topk_group=5),
+               dict(topk_method="group_limited_greedy", n_group=4, topk_group=1,
+                    num_experts_per_tok=3)]:
+        with pytest.raises(ValueError):
+            GPTConfig(**{**base, **kw})
 
 
 # ----------------------------------------------------------------------------

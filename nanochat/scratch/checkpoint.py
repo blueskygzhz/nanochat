@@ -92,7 +92,10 @@ def load_checkpoint(base_dir, step, model=None, optimizer=None):
         meta = json.loads(f.read())
 
     if model is None:
-        model = GPT(GPTConfig(**meta["config"]))
+        cfg = dict(meta["config"])
+        # Checkpoints from before `moe_hidden_act` existed have relu^2 experts
+        cfg.setdefault("moe_hidden_act", "relu2")
+        model = GPT(GPTConfig(**cfg))
     with np.load(os.path.join(src, "model.npz")) as z:
         model.load_state_dict({k: z[k] for k in z.files})
 

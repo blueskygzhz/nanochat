@@ -44,11 +44,28 @@ def parse_args():
     p.add_argument("--depth", type=int, default=4, help="number of layers; width is derived from it")
     p.add_argument("--sequence-len", type=int, default=64)
     p.add_argument("--window-pattern", type=str, default="SSSL")
-    # moe
+    p.add_argument("--hidden-act", type=str, default="relu2", choices=["relu2", "silu"],
+                   help="dense FFN: relu2 (nanochat) or silu = SwiGLU (DeepSeek)")
+    p.add_argument("--intermediate-size", type=int, default=None, help="dense FFN width (default 4*n_embd)")
+    # moe -- names and defaults follow DeepSeek-V2-Lite's config.json; V2 itself is
+    # --topk-method group_limited_greedy --n-group 8 --topk-group 3 --routed-scaling-factor 16
     p.add_argument("--n-routed-experts", type=int, default=0, help="0 => dense model")
-    p.add_argument("--n-shared-experts", type=int, default=0)
+    p.add_argument("--n-shared-experts", type=int, default=2)
     p.add_argument("--num-experts-per-tok", type=int, default=2)
+    p.add_argument("--moe-intermediate-mult", type=float, default=0.6875,
+                   help="expert width / n_embd (V2-Lite: 1408/2048)")
+    p.add_argument("--moe-hidden-act", type=str, default="silu", choices=["relu2", "silu"])
+    p.add_argument("--first-k-dense-replace", type=int, default=1)
+    p.add_argument("--moe-layer-freq", type=int, default=1)
+    p.add_argument("--topk-method", type=str, default="greedy",
+                   choices=["greedy", "group_limited_greedy"])
+    p.add_argument("--n-group", type=int, default=1)
+    p.add_argument("--topk-group", type=int, default=1)
+    p.add_argument("--norm-topk-prob", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--routed-scaling-factor", type=float, default=1.0)
     p.add_argument("--aux-loss-alpha", type=float, default=0.001)
+    p.add_argument("--seq-aux", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--initializer-range", type=float, default=0.02, help="std of the expert init")
     # optimization
     p.add_argument("--num-iterations", type=int, default=400)
     p.add_argument("--batch-size", type=int, default=16, help="rows per micro-batch")
@@ -93,8 +110,15 @@ def derive_config(args, vocab_size):
         sequence_len=args.sequence_len, vocab_size=vocab_size,
         n_layer=depth, n_head=n_head, n_kv_head=max(1, n_head // 2), n_embd=n_embd,
         window_pattern=args.window_pattern,
+        hidden_act=args.hidden_act, intermediate_size=args.intermediate_size,
         n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
-        num_experts_per_tok=args.num_experts_per_tok, aux_loss_alpha=args.aux_loss_alpha,
+        num_experts_per_tok=args.num_experts_per_tok,
+        moe_intermediate_mult=args.moe_intermediate_mult, moe_hidden_act=args.moe_hidden_act,
+        first_k_dense_replace=args.first_k_dense_replace, moe_layer_freq=args.moe_layer_freq,
+        topk_method=args.topk_method, n_group=args.n_group, topk_group=args.topk_group,
+        norm_topk_prob=args.norm_topk_prob, routed_scaling_factor=args.routed_scaling_factor,
+        aux_loss_alpha=args.aux_loss_alpha, seq_aux=args.seq_aux,
+        initializer_range=args.initializer_range,
     )
 
 
@@ -194,6 +218,8 @@ def main():
 
         # Gradient accumulation: average the loss over micro-batches so the gradient
         # matches one big batch rather than being grad_accum_steps times too large.
+        # MoE balance losses are exempt, exactly as in DeepSeek: `add_aux_loss` gives
+        # them gradient 1.0 per micro-batch regardless of this scaling.
         optimizer.zero_grad()
         total = 0.0
         for _ in range(args.grad_accum_steps):
