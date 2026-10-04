@@ -59,8 +59,17 @@ class GPTConfig:
     # dense FFN
     hidden_act: str = "relu2"           # nanochat; "silu" => DeepSeek's SwiGLU MLP
     intermediate_size: int | None = None  # dense FFN width; None => 4 * n_embd
+    # Multi-token prediction (DeepSeek-V3 sec. 2.2). n_mtp = D sequential modules; module
+    # k predicts token t+k+1. They add (mtp_loss_weight / D) * sum_k L_k to the training
+    # loss and serve as the draft model for speculative decoding in `Engine`.
+    n_mtp: int = 0
+    mtp_loss_weight: float = 0.3        # lambda; V3 uses 0.3, then 0.1 late in training
 
     def __post_init__(self):
+        if self.n_mtp < 0:
+            raise ValueError("n_mtp must be >= 0")
+        if self.mtp_loss_weight < 0:
+            raise ValueError("mtp_loss_weight must be >= 0")
         for name in ("hidden_act", "moe_hidden_act"):
             if getattr(self, name) not in ACTIVATIONS:
                 raise ValueError(f"{name} must be one of {ACTIVATIONS}")
@@ -114,9 +123,9 @@ def is_moe_layer(layer_idx, config):
 class CausalSelfAttention(nn.Module):
     VE_GATE_CHANNELS = 12
 
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_ve=None):
         super().__init__()
-        self.layer_idx = layer_idx
+        self.layer_idx = layer_idx  # also this layer's slot in a KVCache
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.head_dim = config.head_dim
@@ -124,8 +133,9 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim)
         self.c_v = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.ve_gate = (nn.Linear(self.VE_GATE_CHANNELS, config.n_kv_head)
-                        if has_ve(layer_idx, config.n_layer) else None)
+        if use_ve is None:
+            use_ve = has_ve(layer_idx, config.n_layer)
+        self.ve_gate = nn.Linear(self.VE_GATE_CHANNELS, config.n_kv_head) if use_ve else None
 
     def forward(self, x, ve, cos_sin, window, kv_cache=None):
         B, T, _ = x.shape
@@ -143,17 +153,22 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q = nn.apply_rotary_emb(q, cos, sin)
         k = nn.apply_rotary_emb(k, cos, sin)
-        q, k = nn.norm(q) * 1.2, nn.norm(k) * 1.2  # QK norm + sharper attention
+        q, k = nn.norm(q, scale=1.2), nn.norm(k, scale=1.2)  # QK norm + sharper attention
 
         if kv_cache is None:
             return self.c_proj(nn.attention(q, k, v, window=window).reshape(B, T, -1))
 
-        # Decoding: append this step's K/V to the cache and attend over the whole
-        # prefix. `offset` tells the mask where these queries sit in absolute
-        # position, which is what keeps the causal/window geometry correct.
+        # Decoding: append this step's K/V to the cache and attend over the prefix.
+        # `offset` tells the mask where these queries sit in absolute position, which
+        # is what keeps the causal/window geometry correct.
         offset = kv_cache.get_pos()
         k_all, v_all = kv_cache.append(self.layer_idx, k.data, v.data)
-        y = nn.attention(q, Tensor(k_all), Tensor(v_all), window=window, offset=offset)
+        # A sliding-window layer can only see keys j >= offset - window, so read just
+        # that slice: per-step attention cost is O(window) instead of O(prefix), and
+        # in steady state the (shifted) mask is the same every step, so it is cached.
+        start = max(0, offset - window) if window >= 0 else 0
+        y = nn.attention(q, Tensor(k_all[:, start:]), Tensor(v_all[:, start:]),
+                         window=window, offset=offset - start)
         return self.c_proj(y.reshape(B, T, -1))
 
 
@@ -316,16 +331,36 @@ class MoE(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_ve=None, moe=None):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = (MoE(config) if is_moe_layer(layer_idx, config)
-                    else MLP(config, config.intermediate_size))
+        self.attn = CausalSelfAttention(config, layer_idx, use_ve=use_ve)
+        if moe is None:
+            moe = is_moe_layer(layer_idx, config)
+        self.mlp = MoE(config) if moe else MLP(config, config.intermediate_size)
 
     def forward(self, x, ve, cos_sin, window, kv_cache=None):
         x = x + self.attn(nn.norm(x), ve, cos_sin, window, kv_cache)
         x = x + self.mlp(nn.norm(x))
         return x
+
+
+class MTPModule(nn.Module):
+    """One multi-token-prediction depth, as in DeepSeek-V3 (sec. 2.2, fig. 3).
+
+        h'_i = proj([ RMSNorm(h_i^{k-1}) ; RMSNorm(Emb(t_{i+k})) ])
+        h_i^k = Block(h'_i)                     -> shared head predicts t_{i+k+1}
+
+    The embedding and output head are the main model's (shared, not copied). The block
+    has full-context attention, no value embedding, and the same FFN kind as the main
+    model's last layer (MoE for an MoE model, as in V3). `depth` (0-based) is also the
+    block's slot in the separate MTP `KVCache` used while drafting.
+    """
+
+    def __init__(self, config, depth):
+        super().__init__()
+        self.proj = nn.Linear(2 * config.n_embd, config.n_embd)
+        self.block = Block(config, depth, use_ve=False,
+                           moe=is_moe_layer(config.n_layer - 1, config))
 
 
 # ----------------------------------------------------------------------------
@@ -350,6 +385,12 @@ class GPT(nn.Module):
             str(i): nn.Embedding(config.vocab_size, config.n_kv_head * config.head_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
+        # Only registered when used, so models without MTP keep their exact state dict
+        if config.n_mtp > 0:
+            self.mtp = nn.ModuleList([MTPModule(config, k) for k in range(config.n_mtp)])
+        else:
+            self.mtp = None
+        self.mtp_loss_values = None  # per-depth MTP losses of the last training forward
         self.cos, self.sin = self._precompute_rotary(config.sequence_len, config.head_dim)
         self.init_weights()
 
@@ -397,31 +438,7 @@ class GPT(nn.Module):
         self.lm_head.weight.data = rng.normal(0.0, 0.001, self.lm_head.weight.shape).astype(dt)
 
         for block in self.h:
-            for lin in (block.attn.c_q, block.attn.c_k, block.attn.c_v):
-                lin.weight.data = rng.uniform(-s, s, lin.weight.shape).astype(dt)
-            block.attn.c_proj.weight.data = np.zeros_like(block.attn.c_proj.weight.data)
-            if block.attn.ve_gate is not None:
-                block.attn.ve_gate.weight.data = rng.uniform(
-                    0.0, 0.02, block.attn.ve_gate.weight.shape).astype(dt)
-
-            if isinstance(block.mlp, MoE):
-                # DeepSeek's `_init_weights`: every expert Linear ~ N(0, initializer_range)
-                experts = list(block.mlp.experts)
-                if block.mlp.shared_experts is not None:
-                    experts.append(block.mlp.shared_experts)
-                std = self.config.initializer_range
-                for expert in experts:
-                    for lin in (*expert.in_projs(), expert.out_proj()):
-                        lin.weight.data = rng.normal(0.0, std, lin.weight.shape).astype(dt)
-                # The router is a bare Parameter, which `_init_weights` skips: it keeps
-                # kaiming_uniform_(a=sqrt(5)), i.e. Uniform(+-1/sqrt(fan_in))
-                block.mlp.gate.weight.data = rng.uniform(
-                    -n_embd ** -0.5, n_embd ** -0.5, block.mlp.gate.weight.shape).astype(dt)
-            else:
-                for lin in block.mlp.in_projs():
-                    lin.weight.data = rng.uniform(-s * 0.4, s * 0.4, lin.weight.shape).astype(dt)
-                out = block.mlp.out_proj()
-                out.weight.data = np.zeros_like(out.weight.data)
+            self._init_block(block, rng)
 
         n_layer = self.config.n_layer
         denom = max(n_layer - 1, 1)
@@ -435,6 +452,45 @@ class GPT(nn.Module):
             0.0, 0.02, self.smear_gate.weight.shape).astype(dt)
         for ve in self.value_embeds.values():
             ve.weight.data = rng.uniform(-s, s, ve.weight.shape).astype(dt)
+
+        # MTP draws come last so a model without MTP initialises exactly as before
+        if self.mtp is not None:
+            s2 = 3 ** 0.5 * (2 * n_embd) ** -0.5  # proj reads [h ; emb], fan_in 2C
+            for module in self.mtp:
+                module.proj.weight.data = rng.uniform(-s2, s2, module.proj.weight.shape).astype(dt)
+                self._init_block(module.block, rng)
+
+    def _init_block(self, block, rng):
+        """Attention: uniform q/k/v, zero output projection. FFN: nanochat's scheme for a
+        dense MLP (zero output projection), DeepSeek-V2's for MoE."""
+        dt = get_dtype()
+        n_embd = self.config.n_embd
+        s = 3 ** 0.5 * n_embd ** -0.5  # sqrt(3) makes Uniform match Normal's std
+        for lin in (block.attn.c_q, block.attn.c_k, block.attn.c_v):
+            lin.weight.data = rng.uniform(-s, s, lin.weight.shape).astype(dt)
+        block.attn.c_proj.weight.data = np.zeros_like(block.attn.c_proj.weight.data)
+        if block.attn.ve_gate is not None:
+            block.attn.ve_gate.weight.data = rng.uniform(
+                0.0, 0.02, block.attn.ve_gate.weight.shape).astype(dt)
+
+        if isinstance(block.mlp, MoE):
+            # DeepSeek's `_init_weights`: every expert Linear ~ N(0, initializer_range)
+            experts = list(block.mlp.experts)
+            if block.mlp.shared_experts is not None:
+                experts.append(block.mlp.shared_experts)
+            std = self.config.initializer_range
+            for expert in experts:
+                for lin in (*expert.in_projs(), expert.out_proj()):
+                    lin.weight.data = rng.normal(0.0, std, lin.weight.shape).astype(dt)
+            # The router is a bare Parameter, which `_init_weights` skips: it keeps
+            # kaiming_uniform_(a=sqrt(5)), i.e. Uniform(+-1/sqrt(fan_in))
+            block.mlp.gate.weight.data = rng.uniform(
+                -n_embd ** -0.5, n_embd ** -0.5, block.mlp.gate.weight.shape).astype(dt)
+        else:
+            for lin in block.mlp.in_projs():
+                lin.weight.data = rng.uniform(-s * 0.4, s * 0.4, lin.weight.shape).astype(dt)
+            out = block.mlp.out_proj()
+            out.weight.data = np.zeros_like(out.weight.data)
 
     # -- forward -------------------------------------------------------------
 
@@ -507,6 +563,63 @@ class GPT(nn.Module):
                 total = m.aux_loss if total is None else total + m.aux_loss
         return total
 
+    # -- multi-token prediction ----------------------------------------------
+
+    def mtp_module_forward(self, depth, h_prev, tokens, T0=0, kv_cache=None):
+        """Run MTP module `depth` (0-based) over a contiguous run of positions.
+
+        h_prev: (B, L, C) -- the main model's hidden states for depth 0, the previous
+                module's outputs otherwise, at absolute positions T0 .. T0+L-1.
+        tokens: (B, L) ints -- t_{i+depth+1} for each of those positions i.
+        Returns the module's output states (B, L, C); `self.logits(nn.norm(.))` turns
+        them into the distribution over t_{i+depth+2}.
+
+        With `kv_cache` (an MTP cache, one layer per depth) the block attends over the
+        cached prefix too; T0 must then equal the cache position. The caller advances it.
+        """
+        module = self.mtp[depth]
+        L = h_prev.shape[1]
+        if T0 + L > self.config.sequence_len:
+            raise ValueError(f"MTP positions up to {T0 + L} exceed rotary cache {self.config.sequence_len}")
+        x = module.proj(cat([nn.norm(h_prev), self.embed_tokens(tokens)], axis=-1))
+        cos_sin = (self.cos[:, T0:T0 + L], self.sin[:, T0:T0 + L])
+        return module.block(x, None, cos_sin, -1, kv_cache)
+
+    def mtp_logits(self, idx, hidden=None):
+        """Teacher-forced MTP predictions for a (B, T) batch.
+
+        Returns one (B, T - k, V) logits tensor per depth k = 1..D: entry i of depth k
+        predicts token t_{i+k+1}, from the main hidden state at i and the true tokens
+        t_{i+1} .. t_{i+k} (the causal chain of V3's fig. 3). Every input token is inside
+        `idx`, so only the targets need the token after the window.
+        """
+        if self.mtp is None:
+            return []
+        idx = np.asarray(idx, dtype=np.int64)
+        T = idx.shape[1]
+        h = self.forward_hidden(idx) if hidden is None else hidden
+        out = []
+        for depth in range(self.config.n_mtp):
+            k = depth + 1
+            L = T - k
+            if L <= 0:
+                break
+            h = self.mtp_module_forward(depth, h[:, :L], idx[:, k:])
+            out.append(self.logits(nn.norm(h)))
+        return out
+
+    def mtp_losses(self, idx, targets, hidden=None):
+        """Per-depth MTP cross-entropy: depth k's position i is scored on t_{i+k+1},
+        which is `targets[:, i + k]` (targets are idx shifted left by one)."""
+        targets = np.asarray(targets)
+        losses = []
+        for depth, logits in enumerate(self.mtp_logits(idx, hidden)):
+            k = depth + 1
+            B, L, V = logits.shape
+            losses.append(cross_entropy(logits.reshape(B * L, V), targets[:, k:].reshape(-1),
+                                        ignore_index=-1))
+        return losses
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
         hidden = self.forward_hidden(idx, kv_cache)
         logits = self.logits(hidden)
@@ -519,19 +632,68 @@ class GPT(nn.Module):
             loss = loss.reshape(B, T)  # (B, T) per-token losses, for bits-per-byte
         # As in DeepSeek, the returned loss is the LM loss only; the MoE balance losses
         # reach the gradient through `add_aux_loss` inside each MoE layer.
+        #
+        # MTP (V3 eq. 25): in training, add (lambda / D) * sum_k L_k. It is a real
+        # objective, so -- unlike the balance loss -- it is part of the returned value
+        # and scales with `loss / grad_accum_steps`. Eval mode and per-token losses
+        # (bits-per-byte) stay pure next-token, so metrics are comparable with and
+        # without MTP. The parts are kept in `mtp_loss_values` for logging.
+        self.mtp_loss_values = None
+        if (self.mtp is not None and self.training and kv_cache is None
+                and loss_reduction == "mean" and self.config.mtp_loss_weight > 0):
+            mtp = self.mtp_losses(idx, targets, hidden)
+            if mtp:
+                self.mtp_loss_values = [m.item() for m in mtp]
+                total = mtp[0]
+                for m in mtp[1:]:
+                    total = total + m
+                loss = loss + total * (self.config.mtp_loss_weight / len(mtp))
         return loss
 
     # -- inference -----------------------------------------------------------
 
     @no_grad()
-    def generate(self, prompt, max_tokens, temperature=1.0, top_k=None, seed=0):
-        """Plain autoregressive sampling. No KV cache: every step re-runs the whole
-        prefix, which is O(n^2) total but keeps the code honest and short."""
+    def generate(self, prompt, max_tokens, temperature=1.0, top_k=None, seed=0, use_cache=True):
+        """Autoregressive sampling for one sequence.
+
+        With `use_cache` (the default) the prompt is prefilled once into a `KVCache`
+        and every later step feeds only the newest token, so each step attends one
+        query against the cached prefix: O(n) forwards' worth of work instead of
+        O(n^2). The cache reproduces the full forward exactly (rotary offset, window
+        masks and the smear's carried embedding all live in it), so both paths emit the
+        same tokens.
+
+        Past `sequence_len` the context slides, as without a cache: the rotary table
+        only covers positions < sequence_len, so the last `sequence_len` tokens are
+        re-prefilled at positions 0.. -- the cache cannot be shifted in place because
+        every cached key is rotated by its absolute position.
+
+        `use_cache=False` keeps the reference O(n^2) loop that re-runs the whole window.
+        """
         rng = np.random.default_rng(seed)
         tokens = list(prompt)
+        if max_tokens <= 0:
+            return tokens
+        if not tokens:
+            raise ValueError("generate needs a non-empty prompt")
+        cap = self.config.sequence_len
+        cache = None
+        if use_cache:
+            from nanochat.scratch.engine import KVCache
+            cache = KVCache.from_config(self.config, batch_size=1, dtype=self.wte.weight.data.dtype)
+
+        def next_logits():
+            if cache is None:
+                window = tokens[-cap:]
+                return self.forward(np.array([window], dtype=np.int64)).data[0, -1]
+            if cache.get_pos() == 0 or cache.get_pos() >= cap:
+                cache.reset()                                    # (re)prefill the window
+                window = tokens[-cap:]
+                return self.forward(np.array([window], dtype=np.int64), kv_cache=cache).data[0, -1]
+            return self.forward(np.array([[tokens[-1]]], dtype=np.int64), kv_cache=cache).data[0, -1]
+
         for _ in range(max_tokens):
-            window = tokens[-self.config.sequence_len:]
-            logits = self.forward(np.array([window], dtype=np.int64)).data[0, -1]
+            logits = next_logits()
             if temperature == 0.0:
                 nxt = int(np.argmax(logits))
             else:

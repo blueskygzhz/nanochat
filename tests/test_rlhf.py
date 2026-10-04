@@ -188,29 +188,38 @@ def test_value_loss_is_half_mse_over_actions():
 
 
 def test_ppo_steps_increase_the_probability_of_a_rewarded_reply():
-    """End to end on one prompt: reward one specific reply, and PPO must make it
+    """End to end on one prompt: reward a set of replies, and PPO must make them
     more likely without touching the frozen reference copy."""
+    from nanochat.scratch import no_grad
     rng = np.random.default_rng(0)
     policy = GPT(tiny_config())
     reference = clone_model(policy)
     from nanochat.scratch import setup_optimizer
     opt = setup_optimizer(policy, matrix_lr=0.01, embedding_lr=0.05, unembedding_lr=0.01, scalar_lr=0.01)
     prompt = [{"role": "user", "content": "x"}]
-    target = TOK.encode("7")[0]
+    # Reward any digit. A single target token is a bad test: the untrained policy is
+    # near-uniform over 265 ids (~0.4% each), so 240 samples usually contain zero hits,
+    # the advantage is pure noise, and pass/fail is decided by float rounding. Ten
+    # rewarded ids (~4%) guarantee real positive-advantage samples every run.
+    targets = [TOK.encode(str(d))[0] for d in range(10)]
+    from nanochat.chat_format import render_prompt
+    prompt_ids = np.array([render_prompt(TOK, prompt)])
 
     def p_target():
-        ro = {"prompt_ids": __import__("nanochat.chat_format", fromlist=["render_prompt"])
-              .render_prompt(TOK, prompt), "response_ids": [target]}
-        _, _, x, y = build_ppo_batch([ro], PAD)
-        return float(np.exp(sequence_logprobs(policy, x, y).data[y != -1][0]))
+        with no_grad():
+            logits = policy(prompt_ids).data[0, -1].astype(np.float64)
+        p = np.exp(logits - logits.max())
+        return float(p[targets].sum() / p.sum())
 
     before = p_target()
     ref_before = {n: p.data.copy() for n, p in reference.named_parameters()}
+    hits = 0
     for it in range(15):
         ro = rollout(Engine(policy, TOK), TOK, [prompt] * 16, max_tokens=1, seed=it)
         _, _, x, y = build_ppo_batch(ro, PAD)
         mask = y != -1
-        reward = np.array([1.0 if r["response_ids"][0] == target else 0.0 for r in ro])
+        reward = np.array([1.0 if r["response_ids"][0] in targets else 0.0 for r in ro])
+        hits += int(reward.sum())
         lp_old = sequence_logprobs(policy, x, y).data.astype(np.float64)
         rewards, _ = kl_penalized_rewards(reward, lp_old, lp_old, mask, 0.0)
         adv, _ = gae(rewards, np.zeros_like(rewards), mask)
@@ -221,7 +230,9 @@ def test_ppo_steps_increase_the_probability_of_a_rewarded_reply():
             opt.zero_grad()
             loss.backward()
             opt.step()
-    assert p_target() > before
+    assert hits > 0, "setup failed: no rewarded sample was ever drawn"
+    after = p_target()
+    assert after > 1.5 * before, f"rewarded mass {before:.4f} -> {after:.4f}"
     for n, p in reference.named_parameters():
         np.testing.assert_array_equal(p.data, ref_before[n], err_msg=n)
 

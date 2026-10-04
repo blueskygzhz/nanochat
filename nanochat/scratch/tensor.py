@@ -31,7 +31,7 @@ __all__ = [
     "Tensor", "no_grad", "is_grad_enabled", "set_dtype", "get_dtype",
     "tensor", "zeros", "ones", "arange",
     "cat", "stack", "softmax", "relu_squared", "swiglu", "rms_norm", "cross_entropy",
-    "masked_fill", "topk", "index_add", "where", "add_aux_loss",
+    "masked_fill", "topk", "index_add", "where", "add_aux_loss", "linear", "rotary",
 ]
 
 
@@ -60,9 +60,28 @@ class no_grad:
         return False
 
     def __call__(self, fn):
-        def wrapper(*args, **kwargs):
-            with no_grad():
-                return fn(*args, **kwargs)
+        import inspect
+        if inspect.isgeneratorfunction(fn):
+            # Calling a generator function only creates the generator; its body runs
+            # later, on each next(). Wrapping the call alone would leave the body with
+            # grad enabled, so grad is switched off around every resumption instead --
+            # and back on while the caller holds control between items.
+            def wrapper(*args, **kwargs):
+                gen = fn(*args, **kwargs)
+                try:
+                    while True:
+                        with no_grad():
+                            try:
+                                item = next(gen)
+                            except StopIteration as stop:
+                                return stop.value
+                        yield item
+                finally:
+                    gen.close()
+        else:
+            def wrapper(*args, **kwargs):
+                with no_grad():
+                    return fn(*args, **kwargs)
         wrapper.__name__ = getattr(fn, "__name__", "wrapped")
         wrapper.__doc__ = fn.__doc__
         return wrapper
@@ -93,7 +112,9 @@ def set_dtype(dtype):
 
 def _as_array(x):
     if isinstance(x, np.ndarray):
-        return x.astype(_DTYPE, copy=False)
+        # Every op output lands here; skipping the astype call when the dtype already
+        # matches is measurable when a decode step builds hundreds of tiny tensors.
+        return x if x.dtype is _DTYPE or x.dtype == _DTYPE else x.astype(_DTYPE)
     return np.asarray(x, dtype=_DTYPE)
 
 
@@ -690,20 +711,80 @@ def add_aux_loss(x, loss):
     return _make(x.data, (x, loss), "add_aux_loss", backward)
 
 
-def rms_norm(t, eps=1e-6):
-    """y = x / sqrt(mean(x^2) + eps)
+def rms_norm(t, eps=1e-6, scale=1.0):
+    """y = scale * x / sqrt(mean(x^2) + eps)
 
     With r = (mean(x^2) + eps)^(-1/2) and d = x.shape[-1]:
-        dL/dx = r*g - (r^3 / d) * x * sum(g * x)
+        dL/dx = r*g - (r^3 / d) * x * sum(g * x)        (g already multiplied by scale)
+
+    `scale` folds a constant gain (the attention's QK-norm x1.2) into the same op. It
+    is applied after the normalisation, exactly like a separate `* scale`, so the
+    result is bit-identical to the unfused form.
     """
     x = t.data
     d = x.shape[-1]
-    r = 1.0 / np.sqrt((x * x).mean(axis=-1, keepdims=True) + eps)
+    # add.reduce / d is what ndarray.mean does internally, minus its Python overhead
+    r = 1.0 / np.sqrt(np.add.reduce(x * x, axis=-1, keepdims=True) / d + eps)
+    y = x * r
+    if scale != 1.0:
+        y *= scale
 
     def backward(g):
+        if scale != 1.0:
+            g = g * scale
         s = (g * x).sum(axis=-1, keepdims=True)
         _accumulate(t, r * g - (r ** 3) * x * s / d)
-    return _make(x * r, (t,), "rms_norm", backward)
+    return _make(y, (t,), "rms_norm", backward)
+
+
+def linear(x, weight):
+    """y = x @ weight.T for weight (out, in), in one op.
+
+    Spelled `x @ weight.mT` this is two graph nodes (a transpose view, then a matmul)
+    and the weight gradient is computed transposed and then transposed back. Fused,
+    leading dims are folded into the rows so both directions are single GEMMs:
+        dx = g @ W        dW = g^T @ x
+    """
+    a, w = x.data, weight.data
+    lead = a.shape[:-1]
+    a2 = a.reshape(-1, a.shape[-1])
+    out = (a2 @ w.T).reshape(*lead, w.shape[0])
+
+    def backward(g):
+        g2 = g.reshape(-1, g.shape[-1])
+        if x.requires_grad:
+            _accumulate(x, (g2 @ w).reshape(a.shape))
+        if weight.requires_grad:
+            _accumulate(weight, g2.T @ a2)
+    return _make(out, (x, weight), "linear", backward)
+
+
+def rotary(x, cos, sin):
+    """Rotary embedding on (B, T, H, D) in one op; `cos`/`sin` are constant arrays
+    broadcastable to (B, T, H, D/2).
+
+        y1 = x1*cos + x2*sin          y2 = -x1*sin + x2*cos
+
+    The backward is the inverse rotation (a rotation's adjoint is its transpose):
+        dx1 = g1*cos - g2*sin         dx2 = g1*sin + g2*cos
+
+    Composed from primitives this is ten graph nodes per call (two slices, four
+    multiplies, a negation, two adds and a concat), called twice per layer.
+    """
+    a = x.data
+    d = a.shape[-1] // 2
+    x1, x2 = a[..., :d], a[..., d:]
+    out = np.empty_like(a)
+    out[..., :d] = x1 * cos + x2 * sin
+    out[..., d:] = x1 * (-sin) + x2 * cos
+
+    def backward(g):
+        g1, g2 = g[..., :d], g[..., d:]
+        dx = np.empty_like(g)
+        dx[..., :d] = g1 * cos - g2 * sin
+        dx[..., d:] = g1 * sin + g2 * cos
+        _accumulate(x, dx)
+    return _make(out, (x,), "rotary", backward)
 
 
 def cross_entropy(logits, targets, ignore_index=-1, reduction="mean"):

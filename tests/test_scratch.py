@@ -32,7 +32,7 @@ from nanochat.scratch.data import (
 )
 from nanochat.scratch.model import GPT, GPTConfig, MoE
 from nanochat.scratch.optim import AdamW, Muon, polar_express, setup_optimizer
-from nanochat.scratch.tensor import Tensor
+from nanochat.scratch.tensor import Tensor, no_grad
 
 
 def test_no_torch_distribution_is_installed():
@@ -203,6 +203,12 @@ OPS = [
     ("softmax",           lambda a: st.softmax(a, -1),              [(3, 7)], False),
     ("softmax_axis0",     lambda a: st.softmax(a, 0),               [(3, 7)], False),
     ("rms_norm",          lambda a: st.rms_norm(a, 1e-6),           [(3, 4, 5)], False),
+    ("rms_norm_scaled",   lambda a: st.rms_norm(a, 1e-6, scale=1.2), [(3, 4, 5)], False),
+    ("linear",            lambda a, w: st.linear(a, w),             [(2, 3, 5), (4, 5)], False),
+    ("linear_2d",         lambda a, w: st.linear(a, w),             [(3, 5), (4, 5)], False),
+    ("rotary",            lambda a: st.rotary(a, np.cos(np.arange(12.0)).reshape(1, 3, 1, 4),
+                                              np.sin(np.arange(12.0)).reshape(1, 3, 1, 4)),
+                                                                    [(2, 3, 2, 8)], False),
     ("norm_fn",           lambda a: snn.norm(a),                    [(2, 3, 5)], False),
     ("cat",               lambda a, b: st.cat([a, b], axis=1),      [(2, 3), (2, 5)], False),
     ("cat_last",          lambda a, b: st.cat([a, b], axis=-1),     [(2, 3, 4), (2, 3, 2)], False),
@@ -263,6 +269,22 @@ def test_add_aux_loss_is_identity_forward_and_injects_unit_gradient(float64_engi
 def test_rms_norm_forward_matches_closed_form(float64_engine):
     _check_forward(lambda a: st.rms_norm(a, 1e-6), [(3, 4, 5)],
                    lambda a: a / np.sqrt((a * a).mean(-1, keepdims=True) + 1e-6))
+
+
+def test_fused_ops_equal_their_unfused_spelling():
+    """The fused ops are a speed change only: each must reproduce the composed form
+    it replaced, bit for bit in float32."""
+    rng = np.random.default_rng(0)
+    x = Tensor(rng.standard_normal((2, 5, 3, 8)).astype(np.float32))
+    np.testing.assert_array_equal(st.rms_norm(x, scale=1.2).data, (st.rms_norm(x) * 1.2).data)
+    a = Tensor(rng.standard_normal((2, 5, 12)).astype(np.float32))
+    w = Tensor(rng.standard_normal((7, 12)).astype(np.float32))
+    np.testing.assert_allclose(st.linear(a, w).data, (a @ w.mT).data, rtol=1e-6, atol=1e-6)
+    cos = rng.standard_normal((1, 5, 1, 4)).astype(np.float32)
+    sin = rng.standard_normal((1, 5, 1, 4)).astype(np.float32)
+    x1, x2 = x[..., :4], x[..., 4:]
+    want = st.cat([x1 * Tensor(cos) + x2 * Tensor(sin), x1 * Tensor(-sin) + x2 * Tensor(cos)], axis=3)
+    np.testing.assert_array_equal(st.rotary(x, cos, sin).data, want.data)
 
 
 def test_rms_norm_output_has_unit_rms(float64_engine):
@@ -696,6 +718,21 @@ def test_attention_rejects_bad_head_counts():
         snn.attention(q, kv, kv)
 
 
+@pytest.mark.parametrize("window,offset,T,S", [(-1, 0, 6, 6), (3, 0, 6, 6), (-1, 5, 1, 6), (2, 7, 2, 4)])
+def test_attention_inference_fast_path_equals_graph_path(window, offset, T, S):
+    """Under no_grad attention skips the Tensor graph; it must produce the same values."""
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal((2, T, 4, 8)).astype(np.float32)
+    k = rng.standard_normal((2, S, 2, 8)).astype(np.float32)
+    v = rng.standard_normal((2, S, 2, 8)).astype(np.float32)
+    graph = snn.attention(Tensor(q, requires_grad=True), Tensor(k), Tensor(v),
+                          window=window, offset=offset)
+    with st.no_grad():
+        fast = snn.attention(Tensor(q), Tensor(k), Tensor(v), window=window, offset=offset)
+    assert graph.requires_grad and not fast.requires_grad
+    np.testing.assert_array_equal(fast.data, graph.data)
+
+
 def test_apply_rotary_emb_matches_closed_form(float64_engine):
     B, T, H, D = 2, 5, 3, 8
     rng = np.random.default_rng(0)
@@ -884,6 +921,24 @@ def test_moe_gradients_with_group_limited_routing(float64_engine):
     _finite_difference_check(config, seed=3)
 
 
+def test_mtp_model_gradients_match_finite_differences(float64_engine):
+    """Two MTP depths: projections, blocks, and the gradient they send into the shared
+    embedding, head and trunk."""
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, n_mtp=2, mtp_loss_weight=0.5)
+    _finite_difference_check(config, seed=5, randomize=True)
+
+
+def test_mtp_moe_model_gradients_match_finite_differences(float64_engine):
+    """For an MoE model the MTP block is MoE too, and its balance loss joins the graph."""
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
+                       vocab_size=16, n_routed_experts=4, n_shared_experts=1,
+                       num_experts_per_tok=2, aux_loss_alpha=0.01, n_mtp=1)
+    model = GPT(config)
+    assert isinstance(model.mtp[0].block.mlp, MoE)
+    _finite_difference_check(config, seed=6, randomize=True)
+
+
 def test_swiglu_dense_and_relu2_expert_gradients(float64_engine):
     """The two non-default activation pairings: SwiGLU dense FFN, relu^2 experts."""
     config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=8,
@@ -894,6 +949,111 @@ def test_swiglu_dense_and_relu2_expert_gradients(float64_engine):
 
 # ----------------------------------------------------------------------------
 # model specifics
+
+def _mtp_model(n_mtp=2, **kw):
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=12,
+                       vocab_size=32, n_mtp=n_mtp, **kw)
+    model = GPT(config)
+    rng = np.random.default_rng(0)
+    for p in model.parameters():  # zero-init projections would make the blocks trivial
+        if p.data.ndim == 2 and not p.data.any():
+            p.data = (rng.standard_normal(p.data.shape) * 0.3).astype(np.float32)
+    return model
+
+
+def test_mtp_is_opt_in_and_does_not_change_the_main_model():
+    base = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=12, vocab_size=32)
+    plain = GPT(base)
+    with_mtp = GPT(GPTConfig(**{**vars(base), "n_mtp": 2}))
+    assert plain.mtp is None and not any(n.startswith("mtp.") for n, _ in plain.named_parameters())
+    names = {n for n, _ in with_mtp.named_parameters()}
+    assert "mtp.0.proj.weight" in names and "mtp.1.block.attn.c_q.weight" in names
+    assert with_mtp.mtp[0].proj.weight.shape == (24, 48)
+    assert with_mtp.mtp[0].block.attn.ve_gate is None, "MTP blocks have no value embedding"
+    shared = dict(with_mtp.named_parameters())
+    for n, p in plain.named_parameters():   # MTP init draws come after the main model's
+        np.testing.assert_array_equal(p.data, shared[n].data, err_msg=n)
+    x = np.random.default_rng(0).integers(0, 32, (2, 12))
+    plain.eval(); with_mtp.eval()
+    np.testing.assert_array_equal(plain(x).data, with_mtp(x).data)
+
+
+def test_mtp_loss_is_added_in_training_only():
+    model = _mtp_model(n_mtp=2, mtp_loss_weight=0.3)
+    rng = np.random.default_rng(1)
+    x, y = rng.integers(0, 32, (2, 12)), rng.integers(0, 32, (2, 12))
+    model.eval()
+    lm = model(x, y).item()
+    assert model.mtp_loss_values is None
+    per_token = model(x, y, loss_reduction="none")
+    np.testing.assert_allclose(per_token.data.mean(), lm, rtol=1e-6)
+    model.train()
+    total = model(x, y).item()
+    parts = model.mtp_loss_values
+    assert len(parts) == 2
+    np.testing.assert_allclose(total, lm + 0.3 / 2 * sum(parts), rtol=1e-5)
+    model.train()
+    assert model(x, y, loss_reduction="none").shape == (2, 12)
+    assert model.mtp_loss_values is None, "per-token losses stay pure next-token"
+
+
+def test_mtp_targets_are_shifted_by_depth():
+    """Depth k at position i predicts t_{i+k+1} = targets[:, i+k]: the first k targets
+    are never scored by depth k, and the last target is scored by every depth."""
+    model = _mtp_model(n_mtp=2)
+    rng = np.random.default_rng(2)
+    x, y = rng.integers(0, 32, (2, 12)), rng.integers(0, 32, (2, 12))
+    base = [l.item() for l in model.mtp_losses(x, y)]
+    y0 = y.copy(); y0[:, 0] = (y0[:, 0] + 1) % 32
+    assert [l.item() for l in model.mtp_losses(x, y0)] == base
+    y1 = y.copy(); y1[:, 1] = (y1[:, 1] + 1) % 32
+    after = [l.item() for l in model.mtp_losses(x, y1)]
+    assert after[0] != base[0] and after[1] == base[1]
+    yl = y.copy(); yl[:, -1] = (yl[:, -1] + 1) % 32
+    assert all(a != b for a, b in zip([l.item() for l in model.mtp_losses(x, yl)], base))
+    ym = y.copy(); ym[:, 5:] = -1                       # ignore_index is honoured
+    assert all(np.isfinite(l.item()) for l in model.mtp_losses(x, ym))
+
+
+def test_mtp_predictions_are_causal():
+    """Depth k at position i may read tokens t_0 .. t_{i+k} and nothing later."""
+    model = _mtp_model(n_mtp=2)
+    model.eval()
+    x = np.random.default_rng(3).integers(0, 32, (1, 12))
+    base = [l.data for l in model.mtp_logits(x)]
+    j = 7
+    x2 = x.copy(); x2[0, j] = (x2[0, j] + 5) % 32
+    for depth, (a, b) in enumerate(zip(base, model.mtp_logits(x2))):
+        k = depth + 1
+        last_safe = j - k - 1          # positions i with i + k < j cannot see t_j
+        np.testing.assert_array_equal(a[:, :last_safe + 1], b.data[:, :last_safe + 1])
+        assert not np.allclose(a[:, last_safe + 1], b.data[:, last_safe + 1])
+
+
+def test_mtp_module_with_kv_cache_matches_teacher_forcing():
+    """Running a depth incrementally against its cache (as the drafter does) must equal
+    the one-shot teacher-forced pass."""
+    from nanochat.scratch import KVCache
+    model = _mtp_model(n_mtp=2)
+    model.eval()
+    x = np.random.default_rng(4).integers(0, 32, (1, 12))
+    full = model.mtp_logits(x)
+    with no_grad():
+        h = model.forward_hidden(x)
+        kv = KVCache(1, model.config.n_kv_head, 12, model.config.head_dim, 2)
+        outs = []
+        for lo, hi in ((0, 4), (4, 5), (5, 10)):
+            h1 = model.mtp_module_forward(0, h[:, lo:hi], x[:, lo + 1:hi + 1], T0=lo, kv_cache=kv)
+            kv.advance(hi - lo)
+            outs.append(model.logits(snn.norm(h1)).data)
+    np.testing.assert_allclose(np.concatenate(outs, axis=1), full[0].data[:, :10], atol=1e-5)
+
+
+def test_mtp_config_validation():
+    for kw in (dict(n_mtp=-1), dict(mtp_loss_weight=-0.1)):
+        with pytest.raises(ValueError):
+            GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, **kw)
+
 
 def test_logits_are_softcapped():
     """15*tanh(z/15) must keep logits bounded however large the projection gets."""
@@ -971,6 +1131,58 @@ def test_generate_respects_top_k_and_seed():
     assert a == b, "same seed must reproduce"
     assert all(0 <= t < 32 for t in a)
     assert a != c, "different seeds should diverge"
+
+
+@pytest.mark.parametrize("kw", [
+    dict(temperature=0.0),
+    dict(temperature=1.0, top_k=5, seed=3),
+    dict(temperature=0.7, seed=11),
+], ids=["greedy", "top_k", "temperature"])
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_generate_with_kv_cache_matches_full_recompute(kw, moe):
+    """Cached decoding must emit exactly the tokens the O(n^2) loop emits, including
+    after the context fills up and starts sliding (prompt 5 + 20 new > seq_len 16)."""
+    extra = dict(n_routed_experts=4, n_shared_experts=1, num_experts_per_tok=2) if moe else {}
+    config = GPTConfig(n_layer=3, n_head=2, n_kv_head=1, n_embd=24, sequence_len=16,
+                       vocab_size=32, window_pattern="SL", **extra)
+    model = GPT(config)
+    rng = np.random.default_rng(0)
+    for p in model.parameters():  # zero-init projections would make every path trivial
+        if p.data.ndim == 2 and not p.data.any():
+            p.data = (rng.standard_normal(p.data.shape) * 0.3).astype(np.float32)
+    prompt = [1, 2, 3, 4, 5]
+    cached = model.generate(prompt, 20, use_cache=True, **kw)
+    full = model.generate(prompt, 20, use_cache=False, **kw)
+    assert cached == full
+    assert len(cached) == 25
+
+
+def test_generate_with_kv_cache_feeds_one_token_per_step():
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=16, vocab_size=32)
+    model = GPT(config)
+    seen = []
+    forward = model.forward
+
+    def spy(idx, *a, **k):
+        seen.append(np.asarray(idx).shape[1])
+        return forward(idx, *a, **k)
+    model.forward = spy
+    model.generate([1, 2, 3, 4], 6, temperature=0.0)
+    assert seen == [4, 1, 1, 1, 1, 1], "prefill once, then one token per step"
+
+    seen.clear()
+    model.generate([1, 2, 3, 4], 6, temperature=0.0, use_cache=False)
+    assert seen == [4, 5, 6, 7, 8, 9], "the reference path re-runs the whole prefix"
+
+    seen.clear()
+    model.generate(list(range(14)), 5, temperature=0.0)   # fills 16, then slides
+    assert seen == [14, 1, 1, 16, 16]
+
+
+def test_generate_with_kv_cache_accepts_a_one_token_prompt():
+    config = GPTConfig(n_layer=2, n_head=2, n_kv_head=1, n_embd=24, sequence_len=16, vocab_size=32)
+    out = GPT(config).generate([7], 4, temperature=0.0)
+    assert len(out) == 5 and out[0] == 7
 
 
 def test_generate_does_not_build_a_graph():

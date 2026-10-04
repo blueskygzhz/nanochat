@@ -201,14 +201,20 @@ def rollout(engine, tokenizer, prompts, max_tokens, temperature=1.0, seed=0, num
 
     Returns one dict per sample: prompt ids, response ids (including the end-of-turn
     token if one was emitted), and the reply parsed back into `content`/`stop_reason`.
+
+    Per-prompt seeds are drawn from a `SeedSequence(seed)`, not `seed + i`. With the
+    latter, two calls whose seeds differ by less than `len(prompts)` (e.g. a training
+    loop passing `seed=iteration`) reuse almost all the same sampler streams, so
+    successive "fresh" rollouts are near-copies of each other.
     """
     from nanochat.chat_format import parse_reply, render_prompt, reply_stop_tokens
     stop = sorted(set(reply_stop_tokens(tokenizer)))
+    seeds = np.random.SeedSequence(seed).generate_state(max(len(prompts), 1))
     out = []
     for i, messages in enumerate(prompts):
         prompt_ids = render_prompt(tokenizer, messages)
         samples = engine.generate_batch(prompt_ids, max_tokens=max_tokens, num_samples=num_samples,
-                                        temperature=temperature, seed=seed + i, stop_tokens=stop)
+                                        temperature=temperature, seed=int(seeds[i]), stop_tokens=stop)
         for response_ids in samples:
             content, stop_reason = parse_reply(tokenizer, response_ids)
             out.append({"messages": messages, "prompt_ids": prompt_ids,

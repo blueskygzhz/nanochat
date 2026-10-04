@@ -15,7 +15,8 @@ import math
 import numpy as np
 
 from nanochat.scratch.tensor import (
-    Tensor, cat, cross_entropy, index_add, no_grad, rms_norm, softmax,
+    Tensor, cat, cross_entropy, index_add, is_grad_enabled, linear, no_grad, rms_norm,
+    rotary, softmax,
 )
 from nanochat.scratch.tensor import relu_squared as _relu_squared
 from nanochat.scratch.tensor import swiglu as _swiglu
@@ -171,7 +172,7 @@ class Linear(Module):
         self.bias = Parameter(np.zeros(out_features)) if bias else None
 
     def forward(self, x):
-        y = x @ self.weight.mT
+        y = linear(x, self.weight)
         return y + self.bias if self.bias is not None else y
 
 
@@ -190,9 +191,11 @@ class Embedding(Module):
         return self.weight[np.asarray(idx, dtype=np.int64)]
 
 
-def norm(x, eps=1e-6):
-    """RMSNorm with no learnable gain, matching nanochat's `norm()`."""
-    return rms_norm(x, eps=eps)
+def norm(x, eps=1e-6, scale=1.0):
+    """RMSNorm with no learnable gain, matching nanochat's `norm()`.
+
+    `scale` is a constant gain fused into the same op (`norm(x) * scale`)."""
+    return rms_norm(x, eps=eps, scale=scale)
 
 
 def relu_squared(x):
@@ -258,12 +261,24 @@ def attention(q, k, v, window=-1, offset=0):
     if H % H_kv:
         raise ValueError(f"n_head {H} must be divisible by n_kv_head {H_kv}")
     rep = H // H_kv
+    mask = _grouped_mask(T, S, window, offset, rep)      # (rep*T, S)
+
+    if not (is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)):
+        # Inference: no graph will be built, so skip the eight Tensor wrappers and run
+        # the same arithmetic in plain numpy (same op order => same result bit for bit).
+        qa = (q.data * (1.0 / math.sqrt(D))).transpose(0, 2, 1, 3).reshape(B, H_kv, rep * T, D)
+        ka = k.data.transpose(0, 2, 1, 3)
+        va = v.data.transpose(0, 2, 1, 3)
+        p = np.where(mask, -np.inf, qa @ ka.swapaxes(-1, -2))
+        p -= p.max(axis=-1, keepdims=True)
+        np.exp(p, out=p)
+        p /= p.sum(axis=-1, keepdims=True)
+        return Tensor((p @ va).reshape(B, H, T, D).transpose(0, 2, 1, 3))
 
     q = (q * (1.0 / math.sqrt(D))).permute(0, 2, 1, 3).reshape(B, H_kv, rep * T, D)
     k = k.permute(0, 2, 1, 3)                            # (B, H_kv, S, D)
     v = v.permute(0, 2, 1, 3)
 
-    mask = _grouped_mask(T, S, window, offset, rep)      # (rep*T, S)
     y = softmax(q @ k.mT, axis=-1, mask=mask) @ v        # (B, H_kv, rep*T, D)
     return y.reshape(B, H, T, D).permute(0, 2, 1, 3)     # back to (B, T, H, D)
 
@@ -273,11 +288,10 @@ def apply_rotary_emb(x, cos, sin):
     which is functionally equivalent since only the relative q/k rotation matters)."""
     if x.ndim != 4:
         raise ValueError("apply_rotary_emb expects (B, T, H, D)")
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return cat([y1, y2], axis=3)
+    # The tables are constants (never trained), so the fused op takes raw arrays
+    cos = cos.data if isinstance(cos, Tensor) else np.asarray(cos)
+    sin = sin.data if isinstance(sin, Tensor) else np.asarray(sin)
+    return rotary(x, cos, sin)
 
 
 __all__ += ["causal_window_mask", "apply_rotary_emb", "index_add", "cat", "softmax"]

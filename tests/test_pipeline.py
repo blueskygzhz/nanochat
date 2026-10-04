@@ -92,6 +92,28 @@ def test_kv_cache_matches_full_forward(tiny_model, prefill_len):
     np.testing.assert_allclose(incremental, full, atol=2e-4, rtol=1e-3)
 
 
+@pytest.mark.parametrize("prefill_len", [1, 3, 20])
+def test_kv_cache_matches_full_forward_past_the_window(prefill_len):
+    """Windowed layers read only the last `window` cached keys; decoding well past the
+    window (and prefilling past it) must still match the full forward."""
+    config = GPTConfig(n_layer=3, n_head=4, n_kv_head=2, n_embd=32, sequence_len=32,
+                       vocab_size=64, window_pattern="SSL")   # window 8 on layers 0-1
+    model = GPT(config)
+    rng = np.random.default_rng(0)
+    for p in model.parameters():
+        if p.data.ndim == 2 and not p.data.any():
+            p.data = (rng.standard_normal(p.data.shape) * 0.2).astype(np.float32)
+    model.eval()
+    assert model.window_sizes == [8, 8, -1]
+    tokens = rng.integers(0, 64, (2, 32))
+    full = model(tokens).data
+    kv = KVCache.from_config(config, batch_size=2)
+    out = [model(tokens[:, :prefill_len], kv_cache=kv).data]
+    for t in range(prefill_len, 32):
+        out.append(model(tokens[:, t:t + 1], kv_cache=kv).data)
+    np.testing.assert_allclose(np.concatenate(out, axis=1), full, atol=1e-5, rtol=1e-4)
+
+
 def test_kv_cache_tracks_position_and_capacity(tiny_model):
     kv = KVCache.from_config(tiny_model.config, batch_size=1, seq_len=8)
     assert kv.get_pos() == 0
