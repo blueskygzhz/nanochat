@@ -18,10 +18,11 @@ from nanochat.scratch.tensor import (
     Tensor, cat, cross_entropy, index_add, no_grad, rms_norm, softmax,
 )
 from nanochat.scratch.tensor import relu_squared as _relu_squared
+from nanochat.scratch.tensor import swiglu as _swiglu
 
 __all__ = [
     "Parameter", "Module", "ModuleList", "ModuleDict",
-    "Linear", "Embedding", "norm", "relu_squared",
+    "Linear", "Embedding", "norm", "relu_squared", "swiglu",
     "attention", "cross_entropy", "no_grad",
 ]
 
@@ -197,6 +198,11 @@ def norm(x, eps=1e-6):
 def relu_squared(x):
     """ReLU squared, the activation nanochat uses in every FFN (one fused op)."""
     return _relu_squared(x)
+
+
+def swiglu(gate, up):
+    """silu(gate) * up, the SwiGLU activation DeepSeek uses (one fused op)."""
+    return _swiglu(gate, up)
 
 
 # ----------------------------------------------------------------------------

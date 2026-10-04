@@ -30,8 +30,8 @@ import numpy as np
 __all__ = [
     "Tensor", "no_grad", "is_grad_enabled", "set_dtype", "get_dtype",
     "tensor", "zeros", "ones", "arange",
-    "cat", "stack", "softmax", "relu_squared", "rms_norm", "cross_entropy",
-    "masked_fill", "topk", "index_add", "where",
+    "cat", "stack", "softmax", "relu_squared", "swiglu", "rms_norm", "cross_entropy",
+    "masked_fill", "topk", "index_add", "where", "add_aux_loss",
 ]
 
 
@@ -652,6 +652,42 @@ def relu_squared(t):
     def backward(g):
         _accumulate(t, (2.0 * g) * r)
     return _make(r * r, (t,), "relu_squared", backward)
+
+
+def swiglu(gate, up):
+    """silu(gate) * up in one op -- the SwiGLU FFN body DeepSeek/LLaMA use.
+
+    With s = sigmoid(a) and silu(a) = a * s:
+        d/da = g * up * s * (1 + a * (1 - s))      d/dup = g * silu(a)
+    """
+    a, b = gate.data, up.data
+    s = 0.5 * (np.tanh(0.5 * a) + 1.0)  # overflow-free sigmoid
+    act = a * s
+
+    def backward(g):
+        if gate.requires_grad:
+            _accumulate(gate, g * b * s * (1.0 + a * (1.0 - s)))
+        if up.requires_grad:
+            _accumulate(up, g * act)
+    return _make(act * b, (gate, up), "swiglu", backward)
+
+
+def add_aux_loss(x, loss):
+    """DeepSeek's `AddAuxiliaryLoss`: identity on `x` in the forward, and in the
+    backward an incoming gradient of exactly 1.0 for the scalar `loss`.
+
+    This ties the auxiliary loss to the activations instead of to the objective, so
+    it is optimised by *any* backward pass that reaches `x`, and its gradient does not
+    scale with whatever the main loss is multiplied by (e.g. 1/grad_accum_steps).
+    """
+    if loss.data.size != 1:
+        raise ValueError("add_aux_loss expects a scalar loss")
+
+    def backward(g):
+        _accumulate(x, g)
+        if loss.requires_grad:
+            _accumulate(loss, np.ones_like(loss.data))
+    return _make(x.data, (x, loss), "add_aux_loss", backward)
 
 
 def rms_norm(t, eps=1e-6):
